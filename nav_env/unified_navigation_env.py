@@ -38,6 +38,7 @@ class UnifiedNavigationEnv(VecEnv):
         obstacle_radius: float = 0.5,
         goal_radius: float = 0.3,
         max_velocity: float = 1.0,
+        max_acceleration: float = 2.0,
         dt: float = 0.1,
         max_episode_steps: Optional[int] = None,
         num_envs: int = 1,
@@ -72,6 +73,7 @@ class UnifiedNavigationEnv(VecEnv):
         self.robot_radius = float(robot_radius)
         self.goal_radius = float(goal_radius)
         self.max_velocity = float(max_velocity)
+        self.max_acceleration = float(max_acceleration)
         self.dt = float(dt)
         self._max_episode_steps = max_episode_steps
         self.num_envs = num_envs
@@ -142,7 +144,7 @@ class UnifiedNavigationEnv(VecEnv):
         self._obstacle_positions: Optional[torch.Tensor] = (
             None  # shape: (num_envs, num_obstacles, 2)
         )
-        self._last_velocity: torch.Tensor = torch.zeros(
+        self._robot_vel: torch.Tensor = torch.zeros(
             (self.num_envs, 2), dtype=torch.float32, device=self.device
         )
         self._elapsed_steps: Optional[torch.Tensor] = None  # shape: (num_envs,)
@@ -198,7 +200,7 @@ class UnifiedNavigationEnv(VecEnv):
             self.np_random = np.random
 
         # Reset state tensors
-        self._last_velocity = torch.zeros(
+        self._robot_vel = torch.zeros(
             (self.num_envs, 2), dtype=torch.float32, device=self.device
         )
         self._elapsed_steps = torch.zeros(
@@ -433,7 +435,7 @@ class UnifiedNavigationEnv(VecEnv):
         if (
             self._robot_pos is None
             or self._goal_pos is None
-            or self._last_velocity is None
+            or self._robot_vel is None
             or self._obstacle_positions is None
         ):
             raise RuntimeError(
@@ -443,7 +445,7 @@ class UnifiedNavigationEnv(VecEnv):
         obs_dict = {
             "robot_pos": self._robot_pos.clone(),
             "goal_pos": self._goal_pos.clone(),
-            "last_velocity": self._last_velocity.clone(),
+            "robot_vel": self._robot_vel.clone(),
         }
         if self.num_obstacles > 0:
             # Reshape obstacle positions and radii for concatenation
@@ -621,34 +623,84 @@ class UnifiedNavigationEnv(VecEnv):
         grad_h = torch.where(use_obstacle.unsqueeze(1), grad_obs, grad_wall)
         return grad_h
 
-    def filter_velocity(
+    def _hessian_vel_term(
         self,
         robot_pos: torch.Tensor,
-        velocity: torch.Tensor,
+        robot_vel: torch.Tensor,
         obstacle_pos: torch.Tensor,
-        obstacle_radius: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Filters the velocity to satisfy the combined CBF (obstacles + walls) constraint
-        using the closed-form solution for single-integrator dynamics with alpha(h)=h.
+        Computes velᵀ ∇²h vel for the active CBF constraint.
+        Obstacles: (||vel||² - (∇h·vel)²) / dist  (curvature of signed distance)
+        Walls: 0  (linear constraints, zero Hessian)
         """
-        # Combined h and gradient (accounts for both obstacles and walls)
-        h = self.h_function(robot_pos, obstacle_pos, obstacle_radius)            # (num_envs,)
-        grad_h = self.gradient_h_function(robot_pos, obstacle_pos)               # (num_envs,2)
+        device = robot_pos.device
+        dtype = robot_pos.dtype
+        num_envs = robot_pos.shape[0]
 
-        # Closed form correction: enforce grad_h @ u + h >= 0
-        u_des = velocity
-        Lgh_u_des = torch.sum(grad_h * u_des, dim=1)                             # (num_envs,)
-        psi = Lgh_u_des + h                                                      # (num_envs,)
+        has_obstacles = obstacle_pos is not None and obstacle_pos.shape[1] > 0
+        if has_obstacles:
+            distances = torch.linalg.norm(robot_pos.unsqueeze(1) - obstacle_pos, dim=2)
+            h_obs_all = distances - (self.robot_radius + self._obstacle_radii)
+            min_h_obs, min_idx = torch.min(h_obs_all, dim=1)
+            d_active = distances[torch.arange(num_envs, device=device), min_idx].clamp_min(1e-8)
+            closest_obs = obstacle_pos[torch.arange(num_envs, device=device), min_idx]
+            n_obs = (robot_pos - closest_obs) / d_active.unsqueeze(1)
+            v_dot_n = torch.sum(robot_vel * n_obs, dim=1)
+            lf2h_obs = (torch.sum(robot_vel ** 2, dim=1) - v_dot_n ** 2) / d_active
+        else:
+            min_h_obs = torch.full((num_envs,), float("inf"), device=device, dtype=dtype)
+            lf2h_obs = torch.zeros(num_envs, device=device, dtype=dtype)
 
-        filtered_velocity = velocity.clone()
-        filtered_ids = torch.where(psi < 0)[0]
+        x, y = robot_pos[:, 0], robot_pos[:, 1]
+        h_walls = torch.stack([
+            x - self.robot_radius,
+            (self.world_size - x) - self.robot_radius,
+            y - self.robot_radius,
+            (self.world_size - y) - self.robot_radius,
+        ], dim=1)
+        min_h_wall, _ = torch.min(h_walls, dim=1)
+
+        if has_obstacles:
+            use_obs = min_h_obs <= min_h_wall
+            return torch.where(use_obs, lf2h_obs, torch.zeros(num_envs, device=device, dtype=dtype))
+        return torch.zeros(num_envs, device=device, dtype=dtype)
+
+    def filter_acceleration(
+        self,
+        robot_pos: torch.Tensor,
+        robot_vel: torch.Tensor,
+        accel: torch.Tensor,
+        obstacle_pos: torch.Tensor,
+        obstacle_radius: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Filters acceleration for double-integrator dynamics using a relative-degree-2 CBF.
+
+        Defines ψ₁ = ∇h·vel + h.
+        Enforces ψ̇₁ + ψ₁ ≥ 0, which expands to:
+            ∇h·acc + velᵀ∇²h·vel + 2(∇h·vel) + h ≥ 0
+
+        Returns (filtered_accel, ψ₁). ψ₁ > 0 means safe.
+        """
+        h = self.h_function(robot_pos, obstacle_pos, obstacle_radius)         # (num_envs,)
+        grad_h = self.gradient_h_function(robot_pos, obstacle_pos)            # (num_envs, 2)
+        lf2h = self._hessian_vel_term(robot_pos, robot_vel, obstacle_pos)    # (num_envs,)
+
+        Lfh = torch.sum(grad_h * robot_vel, dim=1)                            # ∇h·vel
+        psi1 = Lfh + h                                                        # composite barrier
+
+        # slack < 0 means the desired accel violates the constraint
+        slack = torch.sum(grad_h * accel, dim=1) + lf2h + 2 * Lfh + h       # (num_envs,)
+
+        filtered_accel = accel.clone()
+        filtered_ids = torch.where(slack < 0)[0]
         if filtered_ids.numel() > 0:
-            denom = torch.sum(grad_h[filtered_ids] ** 2, dim=1).clamp_min(1e-12) # (k,)
-            correction = (-psi[filtered_ids] / denom).unsqueeze(1) * grad_h[filtered_ids]
-            filtered_velocity[filtered_ids] += correction
+            denom = torch.sum(grad_h[filtered_ids] ** 2, dim=1).clamp_min(1e-12)
+            correction = (-slack[filtered_ids] / denom).unsqueeze(1) * grad_h[filtered_ids]
+            filtered_accel[filtered_ids] += correction
 
-        return filtered_velocity, psi
+        return filtered_accel, psi1
 
     def step(self, action: torch.Tensor):
         """
@@ -667,33 +719,28 @@ class UnifiedNavigationEnv(VecEnv):
         if action.device != self.device:
             action = action.to(self.device)
 
-        # 1. Apply Action & Update State (using tensor operations)
-        clipped_action = torch.clamp(action, -self.max_velocity, self.max_velocity)
-        # Always filter velocity to compute psi for potential reward
-        filtered_action, psi = self.filter_velocity(
+        # 1. Apply Action & Update State (double integrator: action = acceleration)
+        clipped_action = torch.clamp(action, -self.max_acceleration, self.max_acceleration)
+        # Always filter acceleration to compute psi for potential reward
+        filtered_action, psi = self.filter_acceleration(
             self._robot_pos,
+            self._robot_vel,
             clipped_action,
             self._obstacle_positions,
             self._obstacle_radii,
         )
 
-        if self.use_cbf_action_filtering:
-            self._last_velocity = filtered_action
-        else:
-            self._last_velocity = clipped_action
+        applied_acc = filtered_action if self.use_cbf_action_filtering else clipped_action
         prev_dist_to_goal = torch.linalg.norm(self._robot_pos - self._goal_pos, dim=1)
 
-        rand_velocity = torch.randn_like(self._last_velocity) * self.max_velocity * self.noise_level
-        new_pos = self._robot_pos + (self._last_velocity + rand_velocity) * self.dt
-        # Clamp position to stay within world boundaries (center of robot)
-        # Note: Clamping here prevents the *center* from going out, but collision check below handles radius overlap
-        self._robot_pos = torch.clamp(
-            new_pos,
-            0.0,  # Clamp center to 0
-            self.world_size,  # Clamp center to world_size
-        )
+        new_vel = self._robot_vel + applied_acc * self.dt
+        new_vel = torch.clamp(new_vel, -self.max_velocity, self.max_velocity)
+        rand_velocity = torch.randn_like(new_vel) * self.max_velocity * self.noise_level
+        new_pos = self._robot_pos + (new_vel + rand_velocity) * self.dt
+        self._robot_pos = torch.clamp(new_pos, 0.0, self.world_size)
+        self._robot_vel = new_vel
         self._elapsed_steps += 1
-        self.episode_length_buf = self._elapsed_steps.clone().int()  # Update buffer
+        self.episode_length_buf = self._elapsed_steps.clone().int()
 
         # --- Vectorized termination/collision/goal logic (using tensor operations) ---
         terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -1153,7 +1200,7 @@ class UnifiedNavigationEnv(VecEnv):
         self._obstacle_positions[reset_indices] = torch.from_numpy(
             obstacle_positions_np[reset_indices]
         ).to(device)
-        self._last_velocity[reset_indices] = 0
+        self._robot_vel[reset_indices] = 0
         self._elapsed_steps[reset_indices] = 0
         self.episode_length_buf[reset_indices] = 0
 

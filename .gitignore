@@ -21,3 +21,4 @@ coverage/
 *.rej
 *.bk
 cbf_env/
+.venv/

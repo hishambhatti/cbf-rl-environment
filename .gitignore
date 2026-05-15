@@ -22,6 +22,3 @@ coverage/
 *.rej
 *.bk
 cbf_env/
-logs/navigation_cbf/
-logs/navigation_filter_only/
-logs/navigation_reward_only/

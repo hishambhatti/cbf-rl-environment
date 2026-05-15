@@ -22,3 +22,4 @@ coverage/
 *.rej
 *.bk
 logs
+cbf_env/

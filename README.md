@@ -74,3 +74,6 @@ python plot_tb_reward_log_steps.py \
     --out-main logs/plots/mean_episode_reward.pdf
 ```
 This generates PDF plots of the training rewards and obstacle collisions over time. The main plot is saved to `logs/plots/mean_episode_reward.pdf` and a summary bar chart to `logs/plots/mean_episode_reward_summary.pdf`.
+
+How to see the logs of the training process:
+```tensorboard --logdir logs/ --port 6006```

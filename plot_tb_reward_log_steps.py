@@ -38,7 +38,7 @@ import matplotlib.ticker as mticker  # ADD THIS
 from matplotlib.lines import Line2D  # NEW: for proxy legend handles
 
 # make the font times new roman
-plt.rcParams["font.family"] = "Times New Roman"
+plt.rcParams["font.family"] = "serif"
 
 # ----------------------------- Readers ---------------------------------
 

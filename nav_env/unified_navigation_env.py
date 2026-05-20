@@ -47,6 +47,7 @@ class UnifiedNavigationEnv(VecEnv):
         use_cbf_action_filtering: bool = True,
         use_cbf_reward_penalty: bool = True,
         noise_level: float = 0.1,
+        dynamics_model: str = "dynamic",  # "dynamic" or "quasi_static"
     ):
         """
         Initializes the UnifiedNavigationEnv.
@@ -84,6 +85,9 @@ class UnifiedNavigationEnv(VecEnv):
         )
         self.use_cbf_action_filtering = use_cbf_action_filtering
         self.use_cbf_reward_penalty = use_cbf_reward_penalty
+        if dynamics_model not in ("dynamic", "quasi_static"):
+            raise ValueError(f"dynamics_model must be 'dynamic' or 'quasi_static', got '{dynamics_model}'")
+        self.dynamics_model = dynamics_model
 
         # Handle obstacle radii - Store as tensor (num_envs, num_obstacles)
         if isinstance(obstacle_radius, (list, np.ndarray, torch.Tensor)):
@@ -666,6 +670,37 @@ class UnifiedNavigationEnv(VecEnv):
             return torch.where(use_obs, lf2h_obs, torch.zeros(num_envs, device=device, dtype=dtype))
         return torch.zeros(num_envs, device=device, dtype=dtype)
 
+    def filter_velocity(
+        self,
+        robot_pos: torch.Tensor,
+        vel: torch.Tensor,
+        obstacle_pos: torch.Tensor,
+        obstacle_radius: torch.Tensor,
+        alpha: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Filters velocity for single-integrator (quasi-static) dynamics using a relative-degree-1 CBF.
+
+        Enforces: ∇h · vel + alpha * h ≥ 0
+
+        Returns (filtered_vel, psi) where psi = ∇h · vel + alpha * h before filtering.
+        psi > 0 means safe.
+        """
+        h = self.h_function(robot_pos, obstacle_pos, obstacle_radius)  # (num_envs,)
+        grad_h = self.gradient_h_function(robot_pos, obstacle_pos)     # (num_envs, 2)
+
+        Lfh = torch.sum(grad_h * vel, dim=1)   # ∇h · vel
+        psi = Lfh + alpha * h                  # (num_envs,)
+
+        filtered_vel = vel.clone()
+        violated = torch.where(psi < 0)[0]
+        if violated.numel() > 0:
+            denom = torch.sum(grad_h[violated] ** 2, dim=1).clamp_min(1e-12)
+            correction = (-psi[violated] / denom).unsqueeze(1) * grad_h[violated]
+            filtered_vel[violated] += correction
+
+        return filtered_vel, psi
+
     def filter_acceleration(
         self,
         robot_pos: torch.Tensor,
@@ -719,26 +754,40 @@ class UnifiedNavigationEnv(VecEnv):
         if action.device != self.device:
             action = action.to(self.device)
 
-        # 1. Apply Action & Update State (double integrator: action = acceleration)
-        clipped_action = torch.clamp(action, -self.max_acceleration, self.max_acceleration)
-        # Always filter acceleration to compute psi for potential reward
-        filtered_action, psi = self.filter_acceleration(
-            self._robot_pos,
-            self._robot_vel,
-            clipped_action,
-            self._obstacle_positions,
-            self._obstacle_radii,
-        )
-
-        applied_acc = filtered_action if self.use_cbf_action_filtering else clipped_action
+        # 1. Apply Action & Update State
         prev_dist_to_goal = torch.linalg.norm(self._robot_pos - self._goal_pos, dim=1)
 
-        new_vel = self._robot_vel + applied_acc * self.dt
-        new_vel = torch.clamp(new_vel, -self.max_velocity, self.max_velocity)
-        rand_velocity = torch.randn_like(new_vel) * self.max_velocity * self.noise_level
-        new_pos = self._robot_pos + (new_vel + rand_velocity) * self.dt
-        self._robot_pos = torch.clamp(new_pos, 0.0, self.world_size)
-        self._robot_vel = new_vel
+        if self.dynamics_model == "quasi_static":
+            # Single integrator: action = velocity command
+            clipped_action = torch.clamp(action, -self.max_velocity, self.max_velocity)
+            filtered_action, psi = self.filter_velocity(
+                self._robot_pos,
+                clipped_action,
+                self._obstacle_positions,
+                self._obstacle_radii,
+            )
+            applied_vel = filtered_action if self.use_cbf_action_filtering else clipped_action
+            rand_velocity = torch.randn_like(applied_vel) * self.max_velocity * self.noise_level
+            new_pos = self._robot_pos + (applied_vel + rand_velocity) * self.dt
+            self._robot_pos = torch.clamp(new_pos, 0.0, self.world_size)
+            self._robot_vel = applied_vel
+        else:
+            # Double integrator: action = acceleration
+            clipped_action = torch.clamp(action, -self.max_acceleration, self.max_acceleration)
+            filtered_action, psi = self.filter_acceleration(
+                self._robot_pos,
+                self._robot_vel,
+                clipped_action,
+                self._obstacle_positions,
+                self._obstacle_radii,
+            )
+            applied_acc = filtered_action if self.use_cbf_action_filtering else clipped_action
+            new_vel = self._robot_vel + applied_acc * self.dt
+            new_vel = torch.clamp(new_vel, -self.max_velocity, self.max_velocity)
+            rand_velocity = torch.randn_like(new_vel) * self.max_velocity * self.noise_level
+            new_pos = self._robot_pos + (new_vel + rand_velocity) * self.dt
+            self._robot_pos = torch.clamp(new_pos, 0.0, self.world_size)
+            self._robot_vel = new_vel
         self._elapsed_steps += 1
         self.episode_length_buf = self._elapsed_steps.clone().int()
 

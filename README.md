@@ -55,7 +55,7 @@ After training, evaluate the learned policy using the test scripts:
 
 Or run `test.py` directly. For example:
 ```bash
-python test.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty
+python test.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty --dynamics_model quasi_static
 ```
 
 The test script automatically finds the latest run directory for the specified environment type and loads the latest checkpoint. It will play out the scenario visually (unless run with `--headless`) and output success rate and failure reasons (e.g., collisions).

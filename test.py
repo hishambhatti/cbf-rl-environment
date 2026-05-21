@@ -36,6 +36,9 @@ def parse_args():
     parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
     parser.add_argument('--headless', action='store_true',
                         help="Run in headless mode (no GUI)")
+    parser.add_argument('--dynamics_model', type=str, default='dynamic',
+                        choices=['dynamic', 'quasi_static'],
+                        help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
     return parser.parse_args()
 
 def find_latest_run_dir(base_log_dir, env_type):
@@ -71,12 +74,13 @@ def test():
     env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs']}
     # Pass the device to the environment
     eval_env = UnifiedNavigationEnv(
-        render_mode=render_mode, 
-        num_envs=1, 
-        noise_level=0.0, 
+        render_mode=render_mode,
+        num_envs=1,
+        noise_level=0.0,
         device=cfg['device'],
         use_cbf_action_filtering=args.use_cbf_action_filtering,
         use_cbf_reward_penalty=args.use_cbf_reward_penalty,
+        dynamics_model=args.dynamics_model,
         **env_kwargs
     )
     print(f"--> Using UnifiedNavigationEnv for evaluation.")

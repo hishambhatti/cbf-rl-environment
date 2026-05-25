@@ -24,9 +24,9 @@ def parse_args():
     parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
     parser.add_argument("--headless", action="store_true",
                         help="Run in headless mode (no GUI).")
-    parser.add_argument('--dynamics_model', type=str, default='dynamic',
+    parser.add_argument('--dynamics_model', type=str, default='quasi_static',
                         choices=['dynamic', 'quasi_static'],
-                        help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
+                        help="Dynamics model: 'quasi_static' (single-integrator, original default) or 'dynamic' (double-integrator)")
     return parser.parse_args()
 
 def train():

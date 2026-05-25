@@ -47,7 +47,7 @@ class UnifiedNavigationEnv(VecEnv):
         use_cbf_action_filtering: bool = True,
         use_cbf_reward_penalty: bool = True,
         noise_level: float = 0.1,
-        dynamics_model: str = "dynamic",  # "dynamic" or "quasi_static"
+        dynamics_model: str = "quasi_static",  # "quasi_static" (single-integrator, original) or "dynamic" (double-integrator)
     ):
         """
         Initializes the UnifiedNavigationEnv.

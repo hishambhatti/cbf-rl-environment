@@ -22,5 +22,3 @@ coverage/
 *.bk
 cbf_env/
 .venv/
-logs/
-logs/plots/mean_episode_reward_log_summary.pdf

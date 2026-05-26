@@ -60,6 +60,32 @@ python test.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty --d
 
 The test script automatically finds the latest run directory for the specified environment type and loads the latest checkpoint. It will play out the scenario visually (unless run with `--headless`) and output success rate and failure reasons (e.g., collisions).
 
+### Backward compatibility for older checkpoints
+
+The observation dict used to expose the robot's velocity under the key
+`last_velocity`. The `param-study` branch renamed it to `robot_vel`. Because the
+flat observation passed to the policy is built by sorting the dict keys
+alphabetically, the rename silently shuffled the feature ordering and broke any
+checkpoint trained against the original layout (success rate fell to a few
+percent).
+
+To make both layouts work, `UnifiedNavigationEnv` now takes an `obs_layout`
+argument with two values:
+
+- `legacy`: dict key is `last_velocity`. Use this for checkpoints trained on
+  `main` before the rename. This was also the era of single-integrator
+  dynamics (`dynamics_model=quasi_static`).
+- `current`: dict key is `robot_vel`. Use this for fresh training on
+  `param-study` and beyond.
+
+`train.py` and `test.py` both expose `--obs_layout {legacy,current}`. New
+training runs additionally drop an `env_meta.json` next to the checkpoint that
+records the `obs_layout` and `dynamics_model` they used; `test.py` reads this
+file and auto-selects the matching configuration, so once you train fresh
+nothing on the test side needs flags. For older runs that have no metadata,
+the auto-detect falls back to `legacy` + `quasi_static`, matching the policies
+trained on the original `main`. Pass the flags explicitly to override.
+
 ## Plotting TensorBoard Logs
 
 The repository includes a script to plot the `Mean episode reward` over training steps from TensorBoard event files. You'll need the paths to your run's event files. 

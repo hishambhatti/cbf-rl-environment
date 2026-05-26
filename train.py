@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime
 import argparse # Import argparse
 
@@ -27,6 +28,12 @@ def parse_args():
     parser.add_argument('--dynamics_model', type=str, default='dynamic',
                         choices=['dynamic', 'quasi_static'],
                         help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
+    parser.add_argument('--obs_layout', type=str, default='current',
+                        choices=list(UnifiedNavigationEnv.OBS_LAYOUTS),
+                        help=("Observation dict key layout. 'legacy' uses key 'last_velocity' "
+                              "(matches checkpoints trained before the rename). 'current' uses "
+                              "key 'robot_vel' (post-rename). The flat obs is built by sorting "
+                              "the dict keys, so this controls feature ordering."))
     return parser.parse_args()
 
 def train():
@@ -68,11 +75,13 @@ def train():
         use_cbf_action_filtering=args.use_cbf_action_filtering,
         use_cbf_reward_penalty=args.use_cbf_reward_penalty,
         dynamics_model=args.dynamics_model,
+        obs_layout=args.obs_layout,
         **env_kwargs
     )
     print(f"--> Using UnifiedNavigationEnv as vectorized environment.")
     print(f"--> use_cbf_action_filtering: {args.use_cbf_action_filtering}")
     print(f"--> use_cbf_reward_penalty: {args.use_cbf_reward_penalty}")
+    print(f"--> obs_layout: {args.obs_layout}")
     
     # add the ability to change run_name to be timestamped
     if not args.headless:
@@ -89,6 +98,25 @@ def train():
         print("\nOnPolicyRunner initialized successfully.")
         # print("--> Using NaiveNavigationEnv as vectorized environment.") # Removed redundant print
         print("--> Check TensorBoard for rollout and reward statistics.\n")
+
+        # Persist the env metadata that the policy was trained against so test.py
+        # can auto-load the right obs layout / dynamics model. The runner creates
+        # its own log subdir; we write into that same directory.
+        run_dir = os.path.join(base_log_dir, cfg['runner']['run_name'])
+        os.makedirs(run_dir, exist_ok=True)
+        meta = {
+            "env": args.env,
+            "obs_layout": args.obs_layout,
+            "dynamics_model": args.dynamics_model,
+            "use_cbf_action_filtering": bool(args.use_cbf_action_filtering),
+            "use_cbf_reward_penalty": bool(args.use_cbf_reward_penalty),
+        }
+        try:
+            with open(os.path.join(run_dir, "env_meta.json"), "w") as f:
+                json.dump(meta, f, indent=2)
+            print(f"--> Wrote env metadata to {os.path.join(run_dir, 'env_meta.json')}")
+        except Exception as e:
+            print(f"Warning: failed to write env_meta.json: {e}")
 
     except Exception as e:
          print(f"\nError initializing OnPolicyRunner: {e}")

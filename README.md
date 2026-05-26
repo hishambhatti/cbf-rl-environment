@@ -55,10 +55,36 @@ After training, evaluate the learned policy using the test scripts:
 
 Or run `test.py` directly. For example:
 ```bash
-python test.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty --dynamics_model dynamic
+python test.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty --dynamics_model quasi_static
 ```
 
 The test script automatically finds the latest run directory for the specified environment type and loads the latest checkpoint. It will play out the scenario visually (unless run with `--headless`) and output success rate and failure reasons (e.g., collisions).
+
+### Backward compatibility for older checkpoints
+
+The observation dict used to expose the robot's velocity under the key
+`last_velocity`. The `param-study` branch renamed it to `robot_vel`. Because the
+flat observation passed to the policy is built by sorting the dict keys
+alphabetically, the rename silently shuffled the feature ordering and broke any
+checkpoint trained against the original layout (success rate fell to a few
+percent).
+
+To make both layouts work, `UnifiedNavigationEnv` now takes an `obs_layout`
+argument with two values:
+
+- `legacy`: dict key is `last_velocity`. Use this for checkpoints trained on
+  `main` before the rename. This was also the era of single-integrator
+  dynamics (`dynamics_model=quasi_static`).
+- `current`: dict key is `robot_vel`. Use this for fresh training on
+  `param-study` and beyond.
+
+`train.py` and `test.py` both expose `--obs_layout {legacy,current}`. New
+training runs additionally drop an `env_meta.json` next to the checkpoint that
+records the `obs_layout` and `dynamics_model` they used; `test.py` reads this
+file and auto-selects the matching configuration, so once you train fresh
+nothing on the test side needs flags. For older runs that have no metadata,
+the auto-detect falls back to `legacy` + `quasi_static`, matching the policies
+trained on the original `main`. Pass the flags explicitly to override.
 
 ## Plotting TensorBoard Logs
 
@@ -83,16 +109,6 @@ python plot_tb_reward_log_steps.py     --naive logs/navigation_naive/navigation_
 Here are the specific files that were run on thorax CPU:
 ``` bash
 python plot_tb_reward_log_steps.py --naive logs/navigation_naive/navigation_naive_20260524_100904/events.out.tfevents.1779642548.thorax.661641.0 --cbf logs/navigation_cbf/navigation_cbf_20260524_121158/events.out.tfevents.1779649921.thorax.701411.0 --only-cbf logs/navigation_filter_only/navigation_filter_only_20260524_121421/events.out.tfevents.1779650065.thorax.703063.0 --soft-cbf logs/navigation_reward_only/navigation_reward_only_20260524_121327/events.out.tfevents.1779650011.thorax.702285.0 --out-main logs/plots/comparison_results_cpu.pdf
-```
-
-On local CPU
-``` bash
-python plot_tb_reward_log_steps.py \
-    --cbf logs/navigation_cbf/navigation_cbf_20260525_204505/events.out.tfevents.1779767106.Hishams-MacBook-Air-3.local.70882.0 \
-    --naive logs/navigation_naive/navigation_naive_20260525_190420/events.out.tfevents.1779761063.Hishams-MacBook-Air-3.local.64782.0 \
-    --only-cbf logs/navigation_filter_only/navigation_filter_only_20260525_195343/events.out.tfevents.1779764025.Hishams-MacBook-Air-3.local.68323.0 \
-    --soft-cbf logs/navigation_reward_only/navigation_reward_only_20260525_201924/events.out.tfevents.1779765565.Hishams-MacBook-Air-3.local.69542.0 \
-    --out-main logs/plots/mean_episode_reward_cpu.pdf
 ```
 
 

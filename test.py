@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import os
 import re # Import re for potential pattern matching if needed
+import json
 import argparse # Import argparse
 
 from config import cfg, get_log_dir, FLATTENED_OBS_SIZE
@@ -36,9 +37,19 @@ def parse_args():
     parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
     parser.add_argument('--headless', action='store_true',
                         help="Run in headless mode (no GUI)")
-    parser.add_argument('--dynamics_model', type=str, default='quasi_static',
+    parser.add_argument('--dynamics_model', type=str, default=None,
                         choices=['dynamic', 'quasi_static'],
-                        help="Dynamics model: 'quasi_static' (single-integrator, original default) or 'dynamic' (double-integrator)")
+                        help=("Dynamics model: 'dynamic' (double-integrator) or "
+                              "'quasi_static' (single-integrator). If unset, auto-detected "
+                              "from env_meta.json; falls back to 'quasi_static' for "
+                              "legacy checkpoints, which were trained before the "
+                              "double-integrator option existed."))
+    parser.add_argument('--obs_layout', type=str, default=None,
+                        choices=list(UnifiedNavigationEnv.OBS_LAYOUTS),
+                        help=("Observation dict key layout the checkpoint expects. "
+                              "If unset, auto-detected from env_meta.json in the run "
+                              "directory; falls back to 'legacy' for older checkpoints "
+                              "trained before the rename of 'last_velocity' -> 'robot_vel'."))
     return parser.parse_args()
 
 def find_latest_run_dir(base_log_dir, env_type):
@@ -69,10 +80,78 @@ def test():
     print(f"Using device: {cfg['device']}")
     print(f"Environment: {args.env.upper()}NavigationEnv (vectorized)") # Use parsed env name
 
+    cfg['runner']['experiment_name'] = f"{cfg['runner']['experiment_name']}_{args.env}"
+
+    # --- Locate the run directory FIRST so we can read env_meta.json before
+    # building the env. Older checkpoints have no metadata file, in which case
+    # we fall back to 'legacy' (key 'last_velocity'), which is the obs layout
+    # they were trained against.
+    base_log_dir = get_log_dir()
+    base_log_dir = os.path.dirname(base_log_dir)
+    if cfg['runner']['load_run'] == -1:
+        latest_run_subdir = find_latest_run_dir(base_log_dir, args.env)
+        if latest_run_subdir is not None:
+             trained_model_log_dir = latest_run_subdir
+             print(f"Found latest run directory for '{args.env}' env: {trained_model_log_dir}")
+        else:
+             print(f"Warning: No run subdirectories found for '{args.env}' env in {base_log_dir}. Trying generic latest.")
+             latest_run_subdir = find_latest_run_dir(base_log_dir, "")
+             if latest_run_subdir:
+                 trained_model_log_dir = latest_run_subdir
+                 print(f"Found generic latest run directory: {trained_model_log_dir}")
+             else:
+                 print(f"Error: No suitable run directory found in {base_log_dir}")
+                 return
+    else:
+        run_name = str(cfg['runner']['load_run'])
+        if f"_{args.env}_" not in run_name:
+            print(f"Warning: 'load_run' value '{run_name}' might not correspond to the selected env '{args.env}'.")
+        trained_model_log_dir = os.path.join(base_log_dir, run_name)
+
+    print(f"Attempting to load model from checkpoint in: {trained_model_log_dir}")
+    if not os.path.isdir(trained_model_log_dir):
+         print(f"Error: Log directory not found: {trained_model_log_dir}")
+         return
+
+    # Resolve obs_layout: explicit CLI > env_meta.json in run dir > legacy default.
+    meta_path = os.path.join(trained_model_log_dir, "env_meta.json")
+    meta = {}
+    if os.path.isfile(meta_path):
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            print(f"Loaded env metadata: {meta}")
+        except Exception as e:
+            print(f"Warning: could not read {meta_path}: {e}")
+
+    if args.obs_layout is not None:
+        resolved_obs_layout = args.obs_layout
+        layout_source = "CLI flag --obs_layout"
+    elif meta.get("obs_layout") in UnifiedNavigationEnv.OBS_LAYOUTS:
+        resolved_obs_layout = meta["obs_layout"]
+        layout_source = f"env_meta.json ({meta_path})"
+    else:
+        resolved_obs_layout = "legacy"
+        layout_source = "default (legacy, for pre-rename checkpoints)"
+    print(f"--> obs_layout resolved to '{resolved_obs_layout}' from {layout_source}")
+
+    # Same priority for dynamics_model so old checkpoints "just work".
+    if args.dynamics_model is not None:
+        resolved_dynamics_model = args.dynamics_model
+        dyn_source = "CLI flag --dynamics_model"
+    elif meta.get("dynamics_model") in ("dynamic", "quasi_static"):
+        resolved_dynamics_model = meta["dynamics_model"]
+        dyn_source = f"env_meta.json ({meta_path})"
+    else:
+        # Legacy checkpoints predate the dynamics_model arg; they were trained
+        # against the single-integrator (quasi_static) physics.
+        resolved_dynamics_model = "quasi_static"
+        dyn_source = "default (quasi_static, for pre-double-integrator checkpoints)"
+    print(f"--> dynamics_model resolved to '{resolved_dynamics_model}' from {dyn_source}")
+
     # --- Environment Setup ---
     render_mode = "human" if cfg['runner']['render_test'] else None
     env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs']}
-    # Pass the device to the environment
     eval_env = UnifiedNavigationEnv(
         render_mode=render_mode,
         num_envs=1,
@@ -80,56 +159,16 @@ def test():
         device=cfg['device'],
         use_cbf_action_filtering=args.use_cbf_action_filtering,
         use_cbf_reward_penalty=args.use_cbf_reward_penalty,
-        dynamics_model=args.dynamics_model,
+        dynamics_model=resolved_dynamics_model,
+        obs_layout=resolved_obs_layout,
         **env_kwargs
     )
     print(f"--> Using UnifiedNavigationEnv for evaluation.")
     print(f"--> use_cbf_action_filtering: {args.use_cbf_action_filtering}")
     print(f"--> use_cbf_reward_penalty: {args.use_cbf_reward_penalty}")
 
-    # Reset returns obs_tensor, extras_dict
     _, extras = eval_env.reset()
-    # Access observation dict from extras
     print(f"Evaluation Environment Observation Dict Keys: {extras['observations'].keys()}")
-    cfg['runner']['experiment_name'] = f"{cfg['runner']['experiment_name']}_{args.env}"
-
-
-    # --- Load Policy ---
-    base_log_dir = get_log_dir()
-    #move one level up to get the base log dir
-    base_log_dir = os.path.dirname(base_log_dir)
-    if cfg['runner']['load_run'] == -1:
-        # Try to find the latest subdirectory for the specific environment type
-        latest_run_subdir = find_latest_run_dir(base_log_dir, args.env) # Pass env type
-        if latest_run_subdir is not None:
-             trained_model_log_dir = latest_run_subdir
-             print(f"Found latest run directory for '{args.env}' env: {trained_model_log_dir}")
-        else:
-             # If no specific env subdirs found, fall back to original behavior (might be less reliable)
-             print(f"Warning: No run subdirectories found for '{args.env}' env in {base_log_dir}. Trying generic latest.")
-             latest_run_subdir = find_latest_run_dir(base_log_dir, "") # Try finding any latest
-             if latest_run_subdir:
-                 trained_model_log_dir = latest_run_subdir
-                 print(f"Found generic latest run directory: {trained_model_log_dir}")
-             else:
-                 print(f"Error: No suitable run directory found in {base_log_dir}")
-                 eval_env.close()
-                 return
-    else:
-        # Construct path for a specific run number/name (assuming it includes env type if needed)
-        # Note: This might need adjustment if 'load_run' doesn't contain env info
-        run_name = str(cfg['runner']['load_run'])
-        # Heuristic: Check if run_name already contains the env type, otherwise append it based on args
-        if f"_{args.env}_" not in run_name:
-            print(f"Warning: 'load_run' value '{run_name}' might not correspond to the selected env '{args.env}'.")
-            # Consider modifying run_name based on args.env if a pattern exists, or rely on user providing correct name.
-        trained_model_log_dir = os.path.join(base_log_dir, run_name)
-
-    print(f"Attempting to load model from checkpoint in: {trained_model_log_dir}")
-    if not os.path.isdir(trained_model_log_dir):
-         print(f"Error: Log directory not found: {trained_model_log_dir}")
-         eval_env.close()
-         return
 
     # --- Determine checkpoint path ---
     cfg['runner']['checkpoint'] = -1 #1500
@@ -344,7 +383,7 @@ def test():
                     if initial_robot_pos is not None: eval_env._robot_pos = initial_robot_pos.clone().to(eval_env.device)
                     if initial_goal_pos is not None: eval_env._goal_pos = initial_goal_pos.clone().to(eval_env.device)
                     if initial_obstacle_positions is not None: eval_env._obstacle_positions = initial_obstacle_positions.clone().to(eval_env.device)
-                    if hasattr(eval_env, "_last_velocity"): eval_env._last_velocity[:] = 0
+                    if hasattr(eval_env, "_robot_vel") and eval_env._robot_vel is not None: eval_env._robot_vel[:] = 0
                     if hasattr(eval_env, "_elapsed_steps") and eval_env._elapsed_steps is not None: eval_env._elapsed_steps[:] = 0
                     eval_env.render()
                 except Exception as e:

@@ -21,11 +21,20 @@ class UnifiedNavigationEnv(VecEnv):
         - 'robot_pos': Tensor(num_envs, 2) - Robot's current [x, y] position.
         - 'obstacles': Tensor(num_envs, num_obstacles * 3) - Concatenated [x, y, radius] for each obstacle.
         - 'goal_pos': Tensor(num_envs, 2) - Goal's target [x, y] position.
-        - 'last_velocity': Tensor(num_envs, 2) - Last commanded velocity [vx, vy].
+        - 'last_velocity' or 'robot_vel': Tensor(num_envs, 2) - Robot's velocity [vx, vy].
+          The key name is controlled by `obs_layout`. The flattened observation vector
+          concatenates dict values in alphabetical key order, so changing the key name
+          changes the layout of the flat observation. Use ``obs_layout='legacy'`` for
+          checkpoints trained before the rename (key was 'last_velocity'), and
+          ``obs_layout='current'`` for newer training runs (key 'robot_vel').
     **Reward:** Combination of goal achievement bonus, collision penalty, and distance shaping (tensor).
     **Termination:** Episode ends if the robot reaches the goal or collides with an obstacle (tensor).
     **Truncation:** Can be handled by wrappers (e.g., TimeLimit).
     """
+
+    # Obs layouts kept in sync with checkpoint feature ordering. See class docstring.
+    OBS_LAYOUTS = ("legacy", "current")
+    _OBS_VEL_KEY = {"legacy": "last_velocity", "current": "robot_vel"}
 
     # metadata and gym.Env inheritance removed
 
@@ -47,7 +56,8 @@ class UnifiedNavigationEnv(VecEnv):
         use_cbf_action_filtering: bool = True,
         use_cbf_reward_penalty: bool = True,
         noise_level: float = 0.1,
-        dynamics_model: str = "quasi_static",  # "quasi_static" (single-integrator, original) or "dynamic" (double-integrator)
+        dynamics_model: str = "dynamic",  # "dynamic" or "quasi_static"
+        obs_layout: str = "legacy",  # "legacy" (key 'last_velocity') or "current" (key 'robot_vel')
     ):
         """
         Initializes the UnifiedNavigationEnv.
@@ -88,6 +98,11 @@ class UnifiedNavigationEnv(VecEnv):
         if dynamics_model not in ("dynamic", "quasi_static"):
             raise ValueError(f"dynamics_model must be 'dynamic' or 'quasi_static', got '{dynamics_model}'")
         self.dynamics_model = dynamics_model
+        if obs_layout not in self.OBS_LAYOUTS:
+            raise ValueError(
+                f"obs_layout must be one of {self.OBS_LAYOUTS}, got '{obs_layout}'"
+            )
+        self.obs_layout = obs_layout
 
         # Handle obstacle radii - Store as tensor (num_envs, num_obstacles)
         if isinstance(obstacle_radius, (list, np.ndarray, torch.Tensor)):
@@ -446,10 +461,11 @@ class UnifiedNavigationEnv(VecEnv):
                 "Environment state is uninitialized. Call reset() before using the environment."
             )
 
+        vel_key = self._OBS_VEL_KEY[self.obs_layout]
         obs_dict = {
             "robot_pos": self._robot_pos.clone(),
             "goal_pos": self._goal_pos.clone(),
-            "robot_vel": self._robot_vel.clone(),
+            vel_key: self._robot_vel.clone(),
         }
         if self.num_obstacles > 0:
             # Reshape obstacle positions and radii for concatenation

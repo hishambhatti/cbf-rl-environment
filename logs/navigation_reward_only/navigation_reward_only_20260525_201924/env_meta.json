@@ -1,0 +1,23 @@
+{
+  "obs_layout": "current",
+  "dynamics_model": "quasi_static",
+  "_provenance": "Empirically probed retroactively (probe_checkpoints.py)",
+  "_probe_results": {
+    "legacy/quasi_static": {
+      "success_pct": 0.0,
+      "mean_reward": -979.5
+    },
+    "legacy/dynamic": {
+      "success_pct": 0.0,
+      "mean_reward": -3812.69
+    },
+    "current/quasi_static": {
+      "success_pct": 60.0,
+      "mean_reward": 2647.38
+    },
+    "current/dynamic": {
+      "success_pct": 40.0,
+      "mean_reward": -1405.88
+    }
+  }
+}

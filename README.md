@@ -85,6 +85,16 @@ Here are the specific files that were run on thorax CPU:
 python plot_tb_reward_log_steps.py --naive logs/navigation_naive/navigation_naive_20260524_100904/events.out.tfevents.1779642548.thorax.661641.0 --cbf logs/navigation_cbf/navigation_cbf_20260524_121158/events.out.tfevents.1779649921.thorax.701411.0 --only-cbf logs/navigation_filter_only/navigation_filter_only_20260524_121421/events.out.tfevents.1779650065.thorax.703063.0 --soft-cbf logs/navigation_reward_only/navigation_reward_only_20260524_121327/events.out.tfevents.1779650011.thorax.702285.0 --out-main logs/plots/comparison_results_cpu.pdf
 ```
 
+On local CPU
+``` bash
+python plot_tb_reward_log_steps.py \
+    --cbf logs/navigation_cbf/navigation_cbf_20260525_204505/events.out.tfevents.1779767106.Hishams-MacBook-Air-3.local.70882.0 \
+    --naive logs/navigation_naive/navigation_naive_20260525_190420/events.out.tfevents.1779761063.Hishams-MacBook-Air-3.local.64782.0 \
+    --only-cbf logs/navigation_filter_only/navigation_filter_only_20260525_195343/events.out.tfevents.1779764025.Hishams-MacBook-Air-3.local.68323.0 \
+    --soft-cbf logs/navigation_reward_only/navigation_reward_only_20260525_201924/events.out.tfevents.1779765565.Hishams-MacBook-Air-3.local.69542.0 \
+    --out-main logs/plots/mean_episode_reward_cpu.pdf
+```
+
 
 This generates PDF plots of the training rewards and obstacle collisions over time. The main plot is saved to `logs/plots/mean_episode_reward.pdf` and a summary bar chart to `logs/plots/mean_episode_reward_summary.pdf`.
 

@@ -17,16 +17,18 @@ except ImportError:
     _RSL_RL_AVAILABLE = False
 
 def parse_args():
-    """Parses command-line arguments."""
+    """Parses command-line arguments. CLI flags override nav_config.yaml defaults."""
     parser = argparse.ArgumentParser(description="Train navigation agent with rsl-rl")
-    parser.add_argument('--env', type=str, default='naive', help="Environment type to use (naive, cbf, reward_only, filter_only, etc.)")
-    parser.add_argument("--use_cbf_action_filtering", action="store_true", help="Use CBF action filtering")
-    parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
-    parser.add_argument("--headless", action="store_true",
-                        help="Run in headless mode (no GUI).")
-    parser.add_argument('--dynamics_model', type=str, default='dynamic',
+    parser.add_argument('--env', type=str, default='naive',
+                        help="Label for this run (naive, cbf, reward_only, filter_only, …)")
+    parser.add_argument("--use_cbf_action_filtering", action="store_true", default=None,
+                        help="Override cbf.use_action_filtering from nav_config.yaml")
+    parser.add_argument("--use_cbf_reward_penalty", action="store_true", default=None,
+                        help="Override cbf.use_reward_penalty from nav_config.yaml")
+    parser.add_argument("--headless", action="store_true", help="Run in headless mode (no GUI).")
+    parser.add_argument('--dynamics_model', type=str, default=None,
                         choices=['dynamic', 'quasi_static'],
-                        help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
+                        help="Override dynamics.model from nav_config.yaml")
     return parser.parse_args()
 
 def train():
@@ -35,21 +37,35 @@ def train():
         print("Cannot proceed without rsl-rl installed.")
         return
 
-    args = parse_args() # Parse arguments
+    args = parse_args()
+
+    # CLI flags override YAML defaults; None means "use YAML value"
+    use_cbf_action_filtering = (
+        args.use_cbf_action_filtering
+        if args.use_cbf_action_filtering is not None
+        else cfg['cbf']['use_action_filtering']
+    )
+    use_cbf_reward_penalty = (
+        args.use_cbf_reward_penalty
+        if args.use_cbf_reward_penalty is not None
+        else cfg['cbf']['use_reward_penalty']
+    )
+    dynamics_model = args.dynamics_model or cfg['env']['dynamics_model']
 
     # Add environment type and timestamp to run name and experiment name for better tracking
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     cfg['runner']['run_name'] = f"{cfg['runner']['run_name']}_{args.env}_{timestamp}"
     cfg['runner']['experiment_name'] = f"{cfg['runner']['experiment_name']}_{args.env}"
 
     print("--- Starting Training ---")
-    print(f"Run Name: {cfg['runner']['run_name']}")
-    print(f"Experiment Name: {cfg['runner']['experiment_name']}")
-    print(f"Device: {cfg['device']}")
-    print(f"Environment: {args.env.upper()}NavigationEnv (vectorized)") # Use parsed env name
-    print(f"Observation Size (Flattened): {FLATTENED_OBS_SIZE}")
-    print(f"Number of Parallel Environments: {cfg['env']['num_envs']}")
-    print(f"Max Training Iterations: {cfg['runner']['max_iterations']}")
+    print(f"Config file:  nav_config.yaml")
+    print(f"Run Name:     {cfg['runner']['run_name']}")
+    print(f"Device:       {cfg['device']}")
+    print(f"Agents:       {cfg['env']['num_agents']}, Obstacles: {cfg['env']['num_obstacles']}, World: {cfg['env']['world_size']}m")
+    print(f"Dynamics:     {dynamics_model}")
+    print(f"CBF filter:   {use_cbf_action_filtering}, CBF penalty: {use_cbf_reward_penalty}")
+    print(f"Obs dim:      {FLATTENED_OBS_SIZE}")
+    print(f"Parallel envs:{cfg['env']['num_envs']}, Max iters: {cfg['runner']['max_iterations']}")
 
     # --- Log Directory ---
     base_log_dir = get_log_dir()
@@ -59,20 +75,16 @@ def train():
     # --- Environment Setup ---
     num_envs = cfg['env']['num_envs']
     print(f"Run name updated to: {cfg['runner']['run_name']}")
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs']}
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'dynamics_model']}
 
     # Instantiate the selected environment
     vec_env = UnifiedNavigationEnv(
         num_envs=num_envs,
-        noise_level=0.0,
-        use_cbf_action_filtering=args.use_cbf_action_filtering,
-        use_cbf_reward_penalty=args.use_cbf_reward_penalty,
-        dynamics_model=args.dynamics_model,
+        use_cbf_action_filtering=use_cbf_action_filtering,
+        use_cbf_reward_penalty=use_cbf_reward_penalty,
+        dynamics_model=dynamics_model,
         **env_kwargs
     )
-    print(f"--> Using UnifiedNavigationEnv as vectorized environment.")
-    print(f"--> use_cbf_action_filtering: {args.use_cbf_action_filtering}")
-    print(f"--> use_cbf_reward_penalty: {args.use_cbf_reward_penalty}")
     
     # add the ability to change run_name to be timestamped
     if not args.headless:

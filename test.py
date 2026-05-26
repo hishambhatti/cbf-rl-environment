@@ -29,16 +29,18 @@ except ImportError:
     _RSL_RL_AVAILABLE = False
 
 def parse_args():
-    """Parses command-line arguments."""
+    """Parses command-line arguments. CLI flags override nav_config.yaml defaults."""
     parser = argparse.ArgumentParser(description="Test navigation agent policy")
-    parser.add_argument('--env', type=str, default='naive', help="Environment type to test (naive, cbf, reward_only, filter_only, etc.)")
-    parser.add_argument("--use_cbf_action_filtering", action="store_true", help="Use CBF action filtering")
-    parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
-    parser.add_argument('--headless', action='store_true',
-                        help="Run in headless mode (no GUI)")
-    parser.add_argument('--dynamics_model', type=str, default='dynamic',
+    parser.add_argument('--env', type=str, default='naive',
+                        help="Run label to load checkpoint from (naive, cbf, …)")
+    parser.add_argument("--use_cbf_action_filtering", action="store_true", default=None,
+                        help="Override cbf.use_action_filtering from nav_config.yaml")
+    parser.add_argument("--use_cbf_reward_penalty", action="store_true", default=None,
+                        help="Override cbf.use_reward_penalty from nav_config.yaml")
+    parser.add_argument('--headless', action='store_true', help="Run in headless mode (no GUI)")
+    parser.add_argument('--dynamics_model', type=str, default=None,
                         choices=['dynamic', 'quasi_static'],
-                        help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
+                        help="Override dynamics.model from nav_config.yaml")
     return parser.parse_args()
 
 def find_latest_run_dir(base_log_dir, env_type):
@@ -63,29 +65,40 @@ def test():
     if not _RSL_RL_AVAILABLE:
         return
 
-    args = parse_args() # Parse command-line arguments
+    args = parse_args()
+
+    # CLI flags override YAML defaults; None means "use YAML value"
+    use_cbf_action_filtering = (
+        args.use_cbf_action_filtering
+        if args.use_cbf_action_filtering is not None
+        else cfg['cbf']['use_action_filtering']
+    )
+    use_cbf_reward_penalty = (
+        args.use_cbf_reward_penalty
+        if args.use_cbf_reward_penalty is not None
+        else cfg['cbf']['use_reward_penalty']
+    )
+    dynamics_model = args.dynamics_model or cfg['env']['dynamics_model']
 
     print("Starting policy evaluation...")
-    print(f"Using device: {cfg['device']}")
-    print(f"Environment: {args.env.upper()}NavigationEnv (vectorized)") # Use parsed env name
+    print(f"Config file:  nav_config.yaml")
+    print(f"Device:       {cfg['device']}")
+    print(f"Agents:       {cfg['env']['num_agents']}, Obstacles: {cfg['env']['num_obstacles']}, World: {cfg['env']['world_size']}m")
+    print(f"Dynamics:     {dynamics_model}")
+    print(f"CBF filter:   {use_cbf_action_filtering}, CBF penalty: {use_cbf_reward_penalty}")
 
     # --- Environment Setup ---
     render_mode = "human" if cfg['runner']['render_test'] else None
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs']}
-    # Pass the device to the environment
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'dynamics_model']}
     eval_env = UnifiedNavigationEnv(
         render_mode=render_mode,
         num_envs=1,
-        noise_level=0.0,
         device=cfg['device'],
-        use_cbf_action_filtering=args.use_cbf_action_filtering,
-        use_cbf_reward_penalty=args.use_cbf_reward_penalty,
-        dynamics_model=args.dynamics_model,
+        use_cbf_action_filtering=use_cbf_action_filtering,
+        use_cbf_reward_penalty=use_cbf_reward_penalty,
+        dynamics_model=dynamics_model,
         **env_kwargs
     )
-    print(f"--> Using UnifiedNavigationEnv for evaluation.")
-    print(f"--> use_cbf_action_filtering: {args.use_cbf_action_filtering}")
-    print(f"--> use_cbf_reward_penalty: {args.use_cbf_reward_penalty}")
 
     # Reset returns obs_tensor, extras_dict
     _, extras = eval_env.reset()
@@ -279,8 +292,7 @@ def test():
             # print(extras['log']['reward_h_potential'])
             obs_tensor = obs_tensor.to(cfg['device']) # Ensure device consistency for next loop iteration
 
-            # Accumulate reward (reward_tensor is shape [1])
-            episode_reward += reward_tensor.item() # Get scalar value from tensor
+            episode_reward += reward_tensor.sum().item()
             step_count += 1
 
             # Optionally render
@@ -291,22 +303,22 @@ def test():
         # Access success flag from the 'log' or 'episode' part of extras, convert tensor to bool
         success_flag = False
         if 'log' in extras and 'success' in extras['log']:
-             success_flag = extras['log']['success'].item() # Get boolean value
-        elif 'episode' in extras and 'success' in extras['episode']: # Fallback check
-             success_flag = extras['episode']['success'].item()
+             success_flag = bool(extras['log']['success'].any().item())
+        elif 'episode' in extras and 'success' in extras['episode']:
+             success_flag = bool(extras['episode']['success'].any().item())
 
         # --- classify failure type ---
         collided_obstacle_flag, collided_wall_flag = False, False
         if 'log' in extras:
             if 'collided_obstacle' in extras['log']:
-                collided_obstacle_flag = bool(extras['log']['collided_obstacle'].item())
+                collided_obstacle_flag = bool(extras['log']['collided_obstacle'].any().item())
             if 'collided_wall' in extras['log']:
-                collided_wall_flag = bool(extras['log']['collided_wall'].item())
+                collided_wall_flag = bool(extras['log']['collided_wall'].any().item())
         elif 'episode' in extras:
             if 'collided_obstacle' in extras['episode']:
-                collided_obstacle_flag = bool(extras['episode']['collided_obstacle'].item())
+                collided_obstacle_flag = bool(extras['episode']['collided_obstacle'].any().item())
             if 'collided_wall' in extras['episode']:
-                collided_wall_flag = bool(extras['episode']['collided_wall'].item())
+                collided_wall_flag = bool(extras['episode']['collided_wall'].any().item())
 
         if success_flag:
             total_successes += 1

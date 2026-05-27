@@ -6,7 +6,7 @@
 environment:
   world_size: 10.0          # was: 10.0 — side length of the square arena (meters)
   num_agents: 2             # was: 2    — agents per world; validated for 1-4
-  num_obstacles: 3          # was: 3    — static circular obstacles per world
+  num_obstacles: 2          # was: 3    — static circular obstacles per world
   robot_radius: 0.2         # was: 0.2  — collision radius of each robot (meters)
   obstacle_radius: 0.5      # was: 0.5  — obstacle radius; scalar applies to all
   goal_radius: 0.3          # was: 0.3  — radius of the goal region (meters)

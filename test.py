@@ -29,18 +29,16 @@ except ImportError:
     _RSL_RL_AVAILABLE = False
 
 def parse_args():
-    """Parses command-line arguments. CLI flags override nav_config.yaml defaults."""
+    """Parses command-line arguments."""
     parser = argparse.ArgumentParser(description="Test navigation agent policy")
-    parser.add_argument('--env', type=str, default='naive',
-                        help="Run label to load checkpoint from (naive, cbf, …)")
-    parser.add_argument("--use_cbf_action_filtering", action="store_true", default=None,
-                        help="Override cbf.use_action_filtering from nav_config.yaml")
-    parser.add_argument("--use_cbf_reward_penalty", action="store_true", default=None,
-                        help="Override cbf.use_reward_penalty from nav_config.yaml")
-    parser.add_argument('--headless', action='store_true', help="Run in headless mode (no GUI)")
-    parser.add_argument('--dynamics_model', type=str, default=None,
+    parser.add_argument('--env', type=str, default='naive', help="Environment type to test (naive, cbf, reward_only, filter_only, etc.)")
+    parser.add_argument("--use_cbf_action_filtering", action="store_true", help="Use CBF action filtering")
+    parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
+    parser.add_argument('--headless', action='store_true',
+                        help="Run in headless mode (no GUI)")
+    parser.add_argument('--dynamics_model', type=str, default='dynamic',
                         choices=['dynamic', 'quasi_static'],
-                        help="Override dynamics.model from nav_config.yaml")
+                        help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
     return parser.parse_args()
 
 def find_latest_run_dir(base_log_dir, env_type):
@@ -65,40 +63,29 @@ def test():
     if not _RSL_RL_AVAILABLE:
         return
 
-    args = parse_args()
-
-    # CLI flags override YAML defaults; None means "use YAML value"
-    use_cbf_action_filtering = (
-        args.use_cbf_action_filtering
-        if args.use_cbf_action_filtering is not None
-        else cfg['cbf']['use_action_filtering']
-    )
-    use_cbf_reward_penalty = (
-        args.use_cbf_reward_penalty
-        if args.use_cbf_reward_penalty is not None
-        else cfg['cbf']['use_reward_penalty']
-    )
-    dynamics_model = args.dynamics_model or cfg['env']['dynamics_model']
+    args = parse_args() # Parse command-line arguments
 
     print("Starting policy evaluation...")
-    print(f"Config file:  nav_config.yaml")
-    print(f"Device:       {cfg['device']}")
-    print(f"Agents:       {cfg['env']['num_agents']}, Obstacles: {cfg['env']['num_obstacles']}, World: {cfg['env']['world_size']}m")
-    print(f"Dynamics:     {dynamics_model}")
-    print(f"CBF filter:   {use_cbf_action_filtering}, CBF penalty: {use_cbf_reward_penalty}")
+    print(f"Using device: {cfg['device']}")
+    print(f"Environment: {args.env.upper()}NavigationEnv (vectorized)") # Use parsed env name
 
     # --- Environment Setup ---
     render_mode = "human" if cfg['runner']['render_test'] else None
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'dynamics_model']}
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs']}
+    # Pass the device to the environment
     eval_env = UnifiedNavigationEnv(
         render_mode=render_mode,
         num_envs=1,
+        noise_level=0.0,
         device=cfg['device'],
-        use_cbf_action_filtering=use_cbf_action_filtering,
-        use_cbf_reward_penalty=use_cbf_reward_penalty,
-        dynamics_model=dynamics_model,
+        use_cbf_action_filtering=args.use_cbf_action_filtering,
+        use_cbf_reward_penalty=args.use_cbf_reward_penalty,
+        dynamics_model=args.dynamics_model,
         **env_kwargs
     )
+    print(f"--> Using UnifiedNavigationEnv for evaluation.")
+    print(f"--> use_cbf_action_filtering: {args.use_cbf_action_filtering}")
+    print(f"--> use_cbf_reward_penalty: {args.use_cbf_reward_penalty}")
 
     # Reset returns obs_tensor, extras_dict
     _, extras = eval_env.reset()

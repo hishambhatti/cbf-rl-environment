@@ -47,7 +47,7 @@ class UnifiedNavigationEnv(VecEnv):
         use_cbf_action_filtering: bool = True,
         use_cbf_reward_penalty: bool = True,
         noise_level: float = 0.1,
-        dynamics_model: str = "quasi_static",  # "dynamic" or "quasi_static"
+        dynamics_model: str = "dynamic",  # "dynamic" or "quasi_static"
         num_agents: int = 1,
     ):
         """
@@ -262,13 +262,14 @@ class UnifiedNavigationEnv(VecEnv):
 
         for env_idx in range(P):
             placement_attempts = 0
-            max_placement_attempts = 200
+            max_placement_attempts = 100  # Increased attempts might be needed
             valid_placement = False
-            min_obstacle_separation_buffer = 0.5
-            # Relax min start-to-goal distance for multi-agent to ease placement.
-            min_robot_goal_distance = (
-                self.world_size / 3.0 if A == 1 else self.world_size / 4.0
+            min_obstacle_separation_buffer = (
+                0.5  # Define minimum buffer between obstacles
             )
+            min_robot_goal_distance = (
+                self.world_size / 3.0
+            )  # Minimum distance between robot and goal start
             # Get radii for the current environment
             current_env_obstacle_radii = obstacle_radii_np[
                 env_idx
@@ -318,8 +319,8 @@ class UnifiedNavigationEnv(VecEnv):
 
                 for agent_idx in range(A):
                     goal_wall_buffer = max(self.goal_radius, self.robot_radius)
-                    robot_wall_buffer = self.robot_radius + 0.5
-                    wall_buffer = self.robot_radius + 0.5
+                    robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+                    wall_buffer = self.robot_radius + 1.0
 
                     # --- Place goal for this agent ---
                     if options and options.get("goal_pos") is not None:
@@ -383,7 +384,7 @@ class UnifiedNavigationEnv(VecEnv):
                     for i, o_pos in enumerate(obs_pos):
                         if (
                             np.linalg.norm(robot_pos - o_pos)
-                            <= self.robot_radius + current_env_obstacle_radii[i] + 0.3
+                            <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
                         ):
                             robot_clear = False
                             break
@@ -393,7 +394,7 @@ class UnifiedNavigationEnv(VecEnv):
 
                     # Clearance from already-placed agents
                     for prev_robot in agent_robots:
-                        if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 0.3:
+                        if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 1.0:
                             robot_clear = False
                             break
                     if not robot_clear:
@@ -405,10 +406,8 @@ class UnifiedNavigationEnv(VecEnv):
                         all_agents_placed = False
                         break
 
-                    # For single-agent, require an obstacle on the direct path to make
-                    # the task non-trivial.  With multiple agents the task is already
-                    # hard enough, so skip this constraint to ease placement.
-                    if agent_idx == 0 and A == 1 and self.num_obstacles > 0:
+                    # Require obstacle on path for agent 0 only (ensures non-trivial task)
+                    if agent_idx == 0 and self.num_obstacles > 0:
                         dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
                         obstacle_blocks_path = False
                         for i, o_pos in enumerate(obs_pos):
@@ -1251,14 +1250,12 @@ class UnifiedNavigationEnv(VecEnv):
             )  # (A-1, 2)
 
             placement_attempts = 0
-            max_placement_attempts = 200
+            max_placement_attempts = 100
             valid_placement = False
-            min_robot_goal_distance = (
-                self.world_size / 3.0 if A == 1 else self.world_size / 4.0
-            )
+            min_robot_goal_distance = self.world_size / 3.0
             goal_wall_buffer = max(self.goal_radius, self.robot_radius)
-            robot_wall_buffer = self.robot_radius + 0.5
-            wall_buffer = self.robot_radius + 0.5
+            robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+            wall_buffer = self.robot_radius + 1.0
 
             new_robot_pos = robot_pos_np[world_e, agent_a].copy()
             new_goal_pos = goal_pos_np[world_e, agent_a].copy()
@@ -1312,7 +1309,7 @@ class UnifiedNavigationEnv(VecEnv):
                 for i, o_pos in enumerate(obs_pos):
                     if (
                         np.linalg.norm(robot_pos - o_pos)
-                        <= self.robot_radius + current_env_obstacle_radii[i] + 0.3
+                        <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
                     ):
                         robot_clear = False
                         break
@@ -1321,7 +1318,7 @@ class UnifiedNavigationEnv(VecEnv):
 
                 # Clearance from sibling agents
                 for sib in sibling_positions:
-                    if np.linalg.norm(robot_pos - sib) <= 2 * self.robot_radius + 0.3:
+                    if np.linalg.norm(robot_pos - sib) <= 2 * self.robot_radius + 1.0:
                         robot_clear = False
                         break
                 if not robot_clear:
@@ -1330,8 +1327,8 @@ class UnifiedNavigationEnv(VecEnv):
                 if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
                     continue
 
-                # For single-agent only, require an obstacle on the direct path.
-                if A == 1 and self.num_obstacles > 0:
+                # Obstacle blocks path check
+                if self.num_obstacles > 0:
                     dist_rg = np.linalg.norm(robot_pos - goal_pos)
                     blocks = False
                     for i, o_pos in enumerate(obs_pos):

@@ -58,7 +58,6 @@ packaging==26.2
 pillow==12.2.0
 protobuf==7.34.1
 pycparser==3.0
-PyYAML==6.0.2
 pyparsing==3.3.2
 python-dateutil==2.9.0.post0
 qpth==0.0.18

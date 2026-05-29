@@ -21,11 +21,18 @@ class UnifiedNavigationEnv(VecEnv):
         - 'robot_pos': Tensor(num_envs, 2) - Robot's current [x, y] position.
         - 'obstacles': Tensor(num_envs, num_obstacles * 3) - Concatenated [x, y, radius] for each obstacle.
         - 'goal_pos': Tensor(num_envs, 2) - Goal's target [x, y] position.
-        - 'last_velocity': Tensor(num_envs, 2) - Last commanded velocity [vx, vy].
+        - 'last_velocity' or 'robot_vel': Tensor(num_envs, 2) - Robot velocity [vx, vy].
+          Key name is controlled by ``obs_layout`` (see below). The flat observation
+          vector is built by sorting dict keys alphabetically, so the key name affects
+          feature ordering. Use ``obs_layout='legacy'`` for checkpoints trained on the
+          original single-agent replication (key ``last_velocity``).
     **Reward:** Combination of goal achievement bonus, collision penalty, and distance shaping (tensor).
     **Termination:** Episode ends if the robot reaches the goal or collides with an obstacle (tensor).
     **Truncation:** Can be handled by wrappers (e.g., TimeLimit).
     """
+
+    OBS_LAYOUTS = ("legacy", "current")
+    _OBS_VEL_KEY = {"legacy": "last_velocity", "current": "robot_vel"}
 
     # metadata and gym.Env inheritance removed
 
@@ -38,6 +45,7 @@ class UnifiedNavigationEnv(VecEnv):
         obstacle_radius: float = 0.5,
         goal_radius: float = 0.3,
         max_velocity: float = 1.0,
+        max_acceleration: float = 2.0,
         dt: float = 0.1,
         max_episode_steps: Optional[int] = None,
         num_envs: int = 1,
@@ -46,6 +54,9 @@ class UnifiedNavigationEnv(VecEnv):
         use_cbf_action_filtering: bool = True,
         use_cbf_reward_penalty: bool = True,
         noise_level: float = 0.1,
+        dynamics_model: str = "quasi_static",  # "dynamic" or "quasi_static"
+        num_agents: int = 1,
+        obs_layout: str = "legacy",  # "legacy" (last_velocity) or "current" (robot_vel)
     ):
         """
         Initializes the UnifiedNavigationEnv.
@@ -72,16 +83,27 @@ class UnifiedNavigationEnv(VecEnv):
         self.robot_radius = float(robot_radius)
         self.goal_radius = float(goal_radius)
         self.max_velocity = float(max_velocity)
+        self.max_acceleration = float(max_acceleration)
         self.dt = float(dt)
         self._max_episode_steps = max_episode_steps
-        self.num_envs = num_envs
-        self.device = device  # Store device
+        self.num_agents = int(num_agents)
+        self._num_parallel_envs = int(num_envs)
+        self.num_envs = self._num_parallel_envs * self.num_agents
+        self.device = device
         self.num_actions = num_actions
         self.max_episode_length = (
             max_episode_steps if max_episode_steps is not None else 1000
         )
         self.use_cbf_action_filtering = use_cbf_action_filtering
         self.use_cbf_reward_penalty = use_cbf_reward_penalty
+        if dynamics_model not in ("dynamic", "quasi_static"):
+            raise ValueError(f"dynamics_model must be 'dynamic' or 'quasi_static', got '{dynamics_model}'")
+        self.dynamics_model = dynamics_model
+        if obs_layout not in self.OBS_LAYOUTS:
+            raise ValueError(
+                f"obs_layout must be one of {self.OBS_LAYOUTS}, got '{obs_layout}'"
+            )
+        self.obs_layout = obs_layout
 
         # Handle obstacle radii - Store as tensor (num_envs, num_obstacles)
         if isinstance(obstacle_radius, (list, np.ndarray, torch.Tensor)):
@@ -102,14 +124,14 @@ class UnifiedNavigationEnv(VecEnv):
                     torch.from_numpy(obstacle_radii_np)
                     .float()
                     .unsqueeze(0)
-                    .expand(self.num_envs, -1)
+                    .expand(self._num_parallel_envs, -1)
                     .to(self.device)
                 )
-            elif obstacle_radii_np.ndim == 2:  # Shape (num_envs, num_obstacles)
-                if obstacle_radii_np.shape != (self.num_envs, self.num_obstacles):
+            elif obstacle_radii_np.ndim == 2:  # Shape (num_parallel_envs, num_obstacles)
+                if obstacle_radii_np.shape != (self._num_parallel_envs, self.num_obstacles):
                     raise ValueError(
                         f"Shape of 2D obstacle_radius {obstacle_radii_np.shape} "
-                        f"must match (num_envs, num_obstacles) ({self.num_envs}, {self.num_obstacles})"
+                        f"must match (num_parallel_envs, num_obstacles) ({self._num_parallel_envs}, {self.num_obstacles})"
                     )
                 self._obstacle_radii = (
                     torch.from_numpy(obstacle_radii_np).float().to(self.device)
@@ -121,7 +143,7 @@ class UnifiedNavigationEnv(VecEnv):
 
         else:  # Float case
             self._obstacle_radii = torch.full(
-                (self.num_envs, self.num_obstacles),
+                (self._num_parallel_envs, self.num_obstacles),
                 float(obstacle_radius),
                 dtype=torch.float32,
                 device=self.device,
@@ -137,15 +159,16 @@ class UnifiedNavigationEnv(VecEnv):
         # self.observation_space = ...
 
         # --- Internal state variables (vectorized tensors) ---
-        self._robot_pos: Optional[torch.Tensor] = None  # shape: (num_envs, 2)
-        self._goal_pos: Optional[torch.Tensor] = None  # shape: (num_envs, 2)
+        # P = _num_parallel_envs, A = num_agents
+        self._robot_pos: Optional[torch.Tensor] = None  # shape: (P, A, 2)
+        self._goal_pos: Optional[torch.Tensor] = None  # shape: (P, A, 2)
         self._obstacle_positions: Optional[torch.Tensor] = (
-            None  # shape: (num_envs, num_obstacles, 2)
+            None  # shape: (P, num_obstacles, 2)
         )
-        self._last_velocity: torch.Tensor = torch.zeros(
-            (self.num_envs, 2), dtype=torch.float32, device=self.device
+        self._robot_vel: torch.Tensor = torch.zeros(
+            (self._num_parallel_envs, self.num_agents, 2), dtype=torch.float32, device=self.device
         )
-        self._elapsed_steps: Optional[torch.Tensor] = None  # shape: (num_envs,)
+        self._elapsed_steps: Optional[torch.Tensor] = None  # shape: (num_envs,) = (P*A,)
         self.episode_length_buf: torch.Tensor = torch.zeros(
             self.num_envs, dtype=torch.int32, device=self.device
         )
@@ -169,7 +192,18 @@ class UnifiedNavigationEnv(VecEnv):
             'reward_step_penalty': torch.zeros(self.num_envs, device=self.device),
         }
 
-        # assert render_mode is None or render_mode in self.metadata["render_modes"]
+        # Tracks whether each agent has reached its goal this world-episode.
+        # Success fires only when every agent in a world has reached its goal.
+        self._agents_reached_goal_buf: torch.Tensor = torch.zeros(
+            (self._num_parallel_envs, self.num_agents), dtype=torch.bool, device=self.device
+        )
+        # Tracks which agents have individually terminated (goal/collision/timeout)
+        # but whose world episode has not ended yet.  Frozen agents stay at their
+        # current position with zero velocity until the world resets.
+        self._world_agents_done_buf: torch.Tensor = torch.zeros(
+            (self._num_parallel_envs, self.num_agents), dtype=torch.bool, device=self.device
+        )
+
         self.reset()  # Call reset to initialize state tensors
 
     # @property
@@ -197,41 +231,49 @@ class UnifiedNavigationEnv(VecEnv):
         else:
             self.np_random = np.random
 
+        P, A = self._num_parallel_envs, self.num_agents
+
         # Reset state tensors
-        self._last_velocity = torch.zeros(
-            (self.num_envs, 2), dtype=torch.float32, device=self.device
+        self._agents_reached_goal_buf = torch.zeros(
+            (P, A), dtype=torch.bool, device=self.device
+        )
+        self._world_agents_done_buf = torch.zeros(
+            (P, A), dtype=torch.bool, device=self.device
+        )
+        self._robot_vel = torch.zeros(
+            (P, A, 2), dtype=torch.float32, device=self.device
         )
         self._elapsed_steps = torch.zeros(
             self.num_envs, dtype=torch.int32, device=self.device
         )
         self.episode_length_buf = torch.zeros_like(
             self._elapsed_steps, dtype=torch.int32
-        )  # Use zeros_like
+        )
 
         # Initialize state tensors
         self._robot_pos = torch.zeros(
-            (self.num_envs, 2), dtype=torch.float32, device=self.device
+            (P, A, 2), dtype=torch.float32, device=self.device
         )
         self._goal_pos = torch.zeros(
-            (self.num_envs, 2), dtype=torch.float32, device=self.device
+            (P, A, 2), dtype=torch.float32, device=self.device
         )
         self._obstacle_positions = torch.zeros(
-            (self.num_envs, self.num_obstacles, 2),
+            (P, self.num_obstacles, 2),
             dtype=torch.float32,
             device=self.device,
         )
 
         # Use NumPy for placement logic, then convert to tensors
-        robot_pos_np = np.zeros((self.num_envs, 2), dtype=np.float32)
-        goal_pos_np = np.zeros((self.num_envs, 2), dtype=np.float32)
+        robot_pos_np = np.zeros((P, A, 2), dtype=np.float32)
+        goal_pos_np = np.zeros((P, A, 2), dtype=np.float32)
         obstacle_positions_np = np.zeros(
-            (self.num_envs, self.num_obstacles, 2), dtype=np.float32
+            (P, self.num_obstacles, 2), dtype=np.float32
         )
         obstacle_radii_np = (
             self._obstacle_radii_np
-        )  # Use the stored numpy version (num_envs, num_obstacles)
+        )  # (P, num_obstacles)
 
-        for env_idx in range(self.num_envs):
+        for env_idx in range(P):
             placement_attempts = 0
             max_placement_attempts = 100  # Increased attempts might be needed
             valid_placement = False
@@ -252,117 +294,24 @@ class UnifiedNavigationEnv(VecEnv):
             while not valid_placement and placement_attempts < max_placement_attempts:
                 placement_attempts += 1
 
-                # 1. Place Obstacles (using NumPy)
+                # 1. Place Obstacles
                 if options and options.get("obstacle_pos") is not None:
                     obs_pos = np.array(options["obstacle_pos"], dtype=np.float32)
                 elif self.num_obstacles > 0:
                     obs_pos = self.np_random.uniform(
-                        0
-                        + current_env_max_obstacle_radius,  # Use env-specific max radius
-                        self.world_size
-                        - current_env_max_obstacle_radius,  # Use env-specific max radius
+                        current_env_max_obstacle_radius,
+                        self.world_size - current_env_max_obstacle_radius,
                         size=(self.num_obstacles, 2),
                     ).astype(np.float32)
                 else:
                     obs_pos = np.empty((0, 2), dtype=np.float32)
 
-                # 2. Place Goal (using NumPy)
-                if options and options.get("goal_pos") is not None:
-                    goal_pos = np.array(options["goal_pos"], dtype=np.float32)
-                else:
-                    # Use a buffer that respects both goal_radius and robot_radius to avoid h < 0 at walls
-                    goal_wall_buffer = max(self.goal_radius, self.robot_radius)
-                    goal_pos = self.np_random.uniform(
-                        0 + goal_wall_buffer,
-                        self.world_size - goal_wall_buffer,
-                        size=(2,),
-                    ).astype(np.float32)
-
-                # 3. Place Robot (using NumPy)
-                if options and options.get("robot_pos") is not None:
-                    robot_pos = np.array(options["robot_pos"], dtype=np.float32)
-                else:
-                    # Sample strictly inside the walls to ensure h_wall > 1.0
-                    robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
-                    robot_pos = self.np_random.uniform(
-                        0 + robot_wall_buffer,
-                        self.world_size - robot_wall_buffer,
-                        size=(2,),
-                    ).astype(np.float32)
-
-                # --- Check for Initial Collisions/Overlaps (using NumPy) ---
-                # Ensure robot h > 1.0 wrt walls (strict)
-                robot_hsafe = True
-                wall_buffer = self.robot_radius + 1.0
-                if (
-                    (robot_pos[0] <= wall_buffer)
-                    or (robot_pos[0] >= self.world_size - wall_buffer)
-                    or (robot_pos[1] <= wall_buffer)
-                    or (robot_pos[1] >= self.world_size - wall_buffer)
-                ):
-                    robot_hsafe = False
-                if not robot_hsafe:
-                    continue
-
-                # Check Robot vs Obstacles (strict >, i.e., reject if <= r_robot + r_obst + 1.0)
-                robot_clear = True
-                for i, o_pos in enumerate(obs_pos):
-                    if (
-                        np.linalg.norm(robot_pos - o_pos)
-                        <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
-                    ):
-                        robot_clear = False
-                        break
-                if not robot_clear:
-                    continue
-
-                # Check Robot vs Goal (minimum distance)
-                # goal_clear_robot = np.linalg.norm(robot_pos - goal_pos) > self.robot_radius + self.goal_radius
-                robot_goal_dist = np.linalg.norm(robot_pos - goal_pos)
-                if robot_goal_dist < min_robot_goal_distance:
-                    continue  # Retry placement if robot and goal are too close
-
-                # New: ensure goal is in an area where CBF h >= 0 (safe w.r.t. obstacles and walls)
-                goal_hsafe = True
-                # Walls check for goal center using robot_radius (h_wall >= 0)
-                if (
-                    (goal_pos[0] < self.robot_radius)
-                    or (goal_pos[0] > self.world_size - self.robot_radius)
-                    or (goal_pos[1] < self.robot_radius)
-                    or (goal_pos[1] > self.world_size - self.robot_radius)
-                ):
-                    goal_hsafe = False
-                # Obstacles check for goal center using robot_radius + obstacle_radius (h_obs >= 0)
-                if goal_hsafe and self.num_obstacles > 0:
-                    for i, o_pos in enumerate(obs_pos):
-                        if (
-                            np.linalg.norm(goal_pos - o_pos)
-                            < (self.robot_radius + current_env_obstacle_radii[i])
-                        ):
-                            goal_hsafe = False
-                            break
-                if not goal_hsafe:
-                    continue
-
-                # Check Goal vs Obstacles (existing, using goal_radius) - keep for extra clearance
-                goal_clear_obstacles = True
-                for i, o_pos in enumerate(obs_pos):
-                    if (
-                        np.linalg.norm(goal_pos - o_pos)
-                        < self.goal_radius + current_env_obstacle_radii[i]
-                    ):
-                        goal_clear_obstacles = False
-                        break
-                if not goal_clear_obstacles:
-                    continue
-
-                # Check Obstacles vs Obstacles (minimum separation)
+                # 2. Check Obstacles vs Obstacles
                 obstacles_clear = True
                 if self.num_obstacles > 1:
                     for i in range(self.num_obstacles):
                         for j in range(i + 1, self.num_obstacles):
                             dist_sq = np.sum((obs_pos[i] - obs_pos[j]) ** 2)
-                            # Use env-specific radii + buffer for minimum separation check
                             min_dist_sq = (
                                 current_env_obstacle_radii[i]
                                 + current_env_obstacle_radii[j]
@@ -373,42 +322,140 @@ class UnifiedNavigationEnv(VecEnv):
                                 break
                         if not obstacles_clear:
                             break
-                    if not obstacles_clear:
-                        continue  # Try placing obstacles again if too close
+                if not obstacles_clear:
+                    continue
 
-                # Check if at least one obstacle is near the robot-goal line
-                obstacle_blocks_path = False
-                if self.num_obstacles > 0:
-                    dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
+                # 3. Place each agent's goal and robot sequentially
+                agent_robots = []
+                agent_goals = []
+                all_agents_placed = True
+
+                for agent_idx in range(A):
+                    goal_wall_buffer = max(self.goal_radius, self.robot_radius)
+                    robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+                    wall_buffer = self.robot_radius + 1.0
+
+                    # --- Place goal for this agent ---
+                    if options and options.get("goal_pos") is not None:
+                        goal_pos = np.array(options["goal_pos"], dtype=np.float32)
+                    else:
+                        goal_pos = self.np_random.uniform(
+                            goal_wall_buffer,
+                            self.world_size - goal_wall_buffer,
+                            size=(2,),
+                        ).astype(np.float32)
+
+                    # Validate goal
+                    goal_hsafe = True
+                    if (
+                        (goal_pos[0] < self.robot_radius)
+                        or (goal_pos[0] > self.world_size - self.robot_radius)
+                        or (goal_pos[1] < self.robot_radius)
+                        or (goal_pos[1] > self.world_size - self.robot_radius)
+                    ):
+                        goal_hsafe = False
+                    if goal_hsafe and self.num_obstacles > 0:
+                        for i, o_pos in enumerate(obs_pos):
+                            if np.linalg.norm(goal_pos - o_pos) < (
+                                self.robot_radius + current_env_obstacle_radii[i]
+                            ):
+                                goal_hsafe = False
+                                break
+                    if goal_hsafe and self.num_obstacles > 0:
+                        for i, o_pos in enumerate(obs_pos):
+                            if np.linalg.norm(goal_pos - o_pos) < (
+                                self.goal_radius + current_env_obstacle_radii[i]
+                            ):
+                                goal_hsafe = False
+                                break
+                    if not goal_hsafe:
+                        all_agents_placed = False
+                        break
+
+                    # --- Place robot for this agent ---
+                    if options and options.get("robot_pos") is not None:
+                        robot_pos = np.array(options["robot_pos"], dtype=np.float32)
+                    else:
+                        robot_pos = self.np_random.uniform(
+                            robot_wall_buffer,
+                            self.world_size - robot_wall_buffer,
+                            size=(2,),
+                        ).astype(np.float32)
+
+                    # Wall clearance
+                    if (
+                        (robot_pos[0] <= wall_buffer)
+                        or (robot_pos[0] >= self.world_size - wall_buffer)
+                        or (robot_pos[1] <= wall_buffer)
+                        or (robot_pos[1] >= self.world_size - wall_buffer)
+                    ):
+                        all_agents_placed = False
+                        break
+
+                    # Clearance from static obstacles
+                    robot_clear = True
                     for i, o_pos in enumerate(obs_pos):
-                        dist_robot_obs = np.linalg.norm(robot_pos - o_pos)
-                        dist_goal_obs = np.linalg.norm(goal_pos - o_pos)
-                        # Check if obstacle center is roughly between robot and goal
-                        # Use env-specific radius
                         if (
-                            abs(dist_robot_obs + dist_goal_obs - dist_robot_goal)
-                            < current_env_obstacle_radii[i] * 2
+                            np.linalg.norm(robot_pos - o_pos)
+                            <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
                         ):
-                            obstacle_blocks_path = True
-                            break  # Found one obstacle on the path
-                    if not obstacle_blocks_path:
-                        continue  # Retry placement if no obstacle blocks the path
-                else:
-                    obstacle_blocks_path = (
-                        True  # No obstacles, so condition is trivially met
-                    )
+                            robot_clear = False
+                            break
+                    if not robot_clear:
+                        all_agents_placed = False
+                        break
 
-                # If all checks pass (including the new h-safe goal check)
-                valid_placement = True
+                    # Clearance from already-placed agents
+                    for prev_robot in agent_robots:
+                        if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 1.0:
+                            robot_clear = False
+                            break
+                    if not robot_clear:
+                        all_agents_placed = False
+                        break
+
+                    # Minimum robot-to-goal distance
+                    if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
+                        all_agents_placed = False
+                        break
+
+                    # Require obstacle on path for agent 0 only (ensures non-trivial task)
+                    if agent_idx == 0 and self.num_obstacles > 0:
+                        dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
+                        obstacle_blocks_path = False
+                        for i, o_pos in enumerate(obs_pos):
+                            if (
+                                abs(
+                                    np.linalg.norm(robot_pos - o_pos)
+                                    + np.linalg.norm(goal_pos - o_pos)
+                                    - dist_robot_goal
+                                )
+                                < current_env_obstacle_radii[i] * 2
+                            ):
+                                obstacle_blocks_path = True
+                                break
+                        if not obstacle_blocks_path:
+                            all_agents_placed = False
+                            break
+
+                    agent_robots.append(robot_pos)
+                    agent_goals.append(goal_pos)
+
+                if all_agents_placed:
+                    valid_placement = True
 
             if not valid_placement:
                 print(
-                    f"Warning: Failed to find valid initial placement for env {env_idx} after {max_placement_attempts} attempts (incl. path block & min dist checks)."
+                    f"Warning: Failed to find valid initial placement for env {env_idx} after {max_placement_attempts} attempts."
                 )
-                # Handle failure? Maybe place at default corners? For now, just warn.
+                # Fall back: place agents at default positions if retry exhausted
+                if len(agent_robots) < A:
+                    for k in range(len(agent_robots), A):
+                        agent_robots.append(np.array([self.world_size * 0.2, self.world_size * (0.2 + k * 0.1)], dtype=np.float32))
+                        agent_goals.append(np.array([self.world_size * 0.8, self.world_size * (0.8 - k * 0.1)], dtype=np.float32))
 
-            robot_pos_np[env_idx] = robot_pos
-            goal_pos_np[env_idx] = goal_pos
+            robot_pos_np[env_idx] = np.array(agent_robots, dtype=np.float32)   # (A, 2)
+            goal_pos_np[env_idx] = np.array(agent_goals, dtype=np.float32)     # (A, 2)
             if self.num_obstacles > 0:
                 obstacle_positions_np[env_idx] = obs_pos
 
@@ -428,55 +475,89 @@ class UnifiedNavigationEnv(VecEnv):
         return obs, extras  # Return tensor obs and dict extras
 
     def _get_obs(self) -> Dict[str, torch.Tensor]:
-        """Constructs the observation dictionary with tensors."""
-        # Defensive: check state initialization
+        """Constructs the observation dictionary with tensors.
+
+        All tensors are flat (num_envs = P*A, ...) where virtual env vi = e*A+a
+        corresponds to agent a in parallel world e.
+        """
         if (
             self._robot_pos is None
             or self._goal_pos is None
-            or self._last_velocity is None
+            or self._robot_vel is None
             or self._obstacle_positions is None
         ):
             raise RuntimeError(
                 "Environment state is uninitialized. Call reset() before using the environment."
             )
 
+        P, A = self._num_parallel_envs, self.num_agents
+        N = P * A  # total virtual envs
+
+        # Flatten agent dim into batch dim: (P, A, 2) -> (P*A, 2)
+        robot_pos_flat = self._robot_pos.reshape(N, 2)
+        goal_pos_flat = self._goal_pos.reshape(N, 2)
+        robot_vel_flat = self._robot_vel.reshape(N, 2)
+
+        vel_key = self._OBS_VEL_KEY[self.obs_layout]
         obs_dict = {
-            "robot_pos": self._robot_pos.clone(),
-            "goal_pos": self._goal_pos.clone(),
-            "last_velocity": self._last_velocity.clone(),
+            "robot_pos": robot_pos_flat,
+            "goal_pos": goal_pos_flat,
+            vel_key: robot_vel_flat,
         }
+
+        # Static obstacles: repeat obstacle data for each agent in the same world
+        # _obstacle_positions: (P, O, 2) -> expand to (P, A, O, 2) -> reshape (P*A, O, 2)
         if self.num_obstacles > 0:
-            # Reshape obstacle positions and radii for concatenation
-            # Obstacle pos: (num_envs, num_obstacles, 2)
-            # Radii: (num_envs, num_obstacles) -> (num_envs, num_obstacles, 1)
-            obstacle_radii_expanded = self._obstacle_radii.unsqueeze(2)  # Add last dim
-            # Concatenate pos and radii: (num_envs, num_obstacles, 3)
-            # get the closest obstacle position relative to the robot position
-            relative_obstacle_positions = self._obstacle_positions - self._robot_pos.unsqueeze(1)
-            obstacle_distances = torch.linalg.norm(relative_obstacle_positions, dim=2)
-            idx_min_distances = torch.argmin(obstacle_distances, dim=1)
-            closest_obstacle_positions = self._obstacle_positions[torch.arange(self.num_envs), idx_min_distances]
-            closest_obstacle_radii = obstacle_radii_expanded[torch.arange(self.num_envs), idx_min_distances]
-            # print("closest_obstacle_positions:", closest_obstacle_positions.unsqueeze(1).shape)
-            # print("self._obstacle_positions:", self._obstacle_positions.shape)
-            # print("obstacle_radii_expanded:", obstacle_radii_expanded.shape)
-            obstacle_info_tensor = torch.cat(
-                (closest_obstacle_positions.unsqueeze(1), closest_obstacle_radii.unsqueeze(1)), dim=2
+            obs_pos_flat = (
+                self._obstacle_positions
+                .unsqueeze(1)
+                .expand(P, A, self.num_obstacles, 2)
+                .reshape(N, self.num_obstacles, 2)
             )
-            # obstacle_info_tensor = torch.cat(
-            #     (self._obstacle_positions, obstacle_radii_expanded), dim=2
-            # )
-            # Flatten: (num_envs, num_obstacles * 3)
-            obs_dict["obstacles"] = obstacle_info_tensor.view(self.num_envs, -1)
+            obs_radii_flat = (
+                self._obstacle_radii
+                .unsqueeze(1)
+                .expand(P, A, self.num_obstacles)
+                .reshape(N, self.num_obstacles)
+            )
+            # Find closest obstacle per virtual env
+            rel_pos = obs_pos_flat - robot_pos_flat.unsqueeze(1)
+            distances = torch.linalg.norm(rel_pos, dim=2)
+            idx_min = torch.argmin(distances, dim=1)
+            arange_N = torch.arange(N, device=self.device)
+            closest_pos = obs_pos_flat[arange_N, idx_min]        # (N, 2)
+            closest_rad = obs_radii_flat[arange_N, idx_min]      # (N,)
+            obstacle_info = torch.cat(
+                [closest_pos, closest_rad.unsqueeze(1)], dim=1
+            ).unsqueeze(1)                                         # (N, 1, 3)
+            obs_dict["obstacles"] = obstacle_info.view(N, -1)     # (N, 3)
         else:
             obs_dict["obstacles"] = torch.empty(
-                (self.num_envs, 0), dtype=torch.float32, device=self.device
+                (N, 0), dtype=torch.float32, device=self.device
             )
+
+        # Other agents: each agent sees the other A-1 agents as dynamic obstacles
+        if A > 1:
+            # _robot_pos: (P, A, 2) -> for agent a, others are all j != a
+            others_list = []
+            for a in range(A):
+                others = torch.cat(
+                    [self._robot_pos[:, :a, :], self._robot_pos[:, a+1:, :]], dim=1
+                )  # (P, A-1, 2)
+                others_list.append(others)
+            # Stack over agent dimension: (P, A, A-1, 2) -> reshape (P*A, A-1, 2)
+            others_pos = torch.stack(others_list, dim=1).reshape(N, A - 1, 2)
+            others_radii = torch.full(
+                (N, A - 1, 1), self.robot_radius, dtype=torch.float32, device=self.device
+            )
+            obs_dict["other_agents"] = torch.cat(
+                [others_pos, others_radii], dim=2
+            ).reshape(N, (A - 1) * 3)                             # (N, (A-1)*3)
+
         return obs_dict
 
     def _get_info(self) -> Dict[str, Any]:
         """Provides auxiliary information about the environment state (tensors where applicable)."""
-        # Defensive: check state initialization
         if (
             self._robot_pos is None
             or self._goal_pos is None
@@ -487,14 +568,26 @@ class UnifiedNavigationEnv(VecEnv):
                 "Environment state is uninitialized. Call reset() before using the environment."
             )
 
-        dist_to_goal = torch.linalg.norm(self._robot_pos - self._goal_pos, dim=1)
+        P, A = self._num_parallel_envs, self.num_agents
+        N = P * A
+        robot_pos_flat = self._robot_pos.reshape(N, 2)
+        goal_pos_flat = self._goal_pos.reshape(N, 2)
+        dist_to_goal = torch.linalg.norm(robot_pos_flat - goal_pos_flat, dim=1)
+
+        # Repeat obstacle positions for each agent in the same world
+        obs_pos_flat = (
+            self._obstacle_positions
+            .unsqueeze(1)
+            .expand(P, A, self.num_obstacles, 2)
+            .reshape(N, self.num_obstacles, 2)
+        )
 
         return {
-            "distance_to_goal": dist_to_goal,  # Tensor
-            "robot_position": self._robot_pos.clone(),  # Tensor
-            "goal_position": self._goal_pos.clone(),  # Tensor
-            "obstacle_positions": self._obstacle_positions.clone(),  # Tensor
-            "elapsed_steps": self._elapsed_steps.clone(),  # Tensor
+            "distance_to_goal": dist_to_goal,
+            "robot_position": robot_pos_flat.clone(),
+            "goal_position": goal_pos_flat.clone(),
+            "obstacle_positions": obs_pos_flat.clone(),
+            "elapsed_steps": self._elapsed_steps.clone(),
         }
 
     def get_observations(self):
@@ -566,7 +659,8 @@ class UnifiedNavigationEnv(VecEnv):
         return h
 
     def gradient_h_function(
-        self, robot_pos: torch.Tensor, obstacle_pos: torch.Tensor
+        self, robot_pos: torch.Tensor, obstacle_pos: torch.Tensor,
+        obstacle_radius: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Computes the gradient of the active CBF constraint (obstacle or wall).
@@ -577,14 +671,15 @@ class UnifiedNavigationEnv(VecEnv):
         dtype = robot_pos.dtype
         num_envs = robot_pos.shape[0]
 
+        if obstacle_radius is None:
+            obstacle_radius = self._obstacle_radii
+
         # Compute obstacle-side h and gradient candidates (if any obstacles)
         has_obstacles = obstacle_pos is not None and obstacle_pos.shape[1] > 0
         if has_obstacles:
             # distances: (num_envs, num_obstacles)
             distances = torch.linalg.norm(robot_pos.unsqueeze(1) - obstacle_pos, dim=2)
-            # h for each obstacle uses per-env obstacle radii
-            # Use self._obstacle_radii since signature does not include radii
-            h_obs_all = distances - (self.robot_radius + self._obstacle_radii)
+            h_obs_all = distances - (self.robot_radius + obstacle_radius)
             # pick the obstacle with minimum h
             min_h_obs, min_idx = torch.min(h_obs_all, dim=1)  # (num_envs,), (num_envs,)
             closest_obs = obstacle_pos[torch.arange(num_envs, device=device), min_idx]  # (num_envs,2)
@@ -621,169 +716,304 @@ class UnifiedNavigationEnv(VecEnv):
         grad_h = torch.where(use_obstacle.unsqueeze(1), grad_obs, grad_wall)
         return grad_h
 
+    def _hessian_vel_term(
+        self,
+        robot_pos: torch.Tensor,
+        robot_vel: torch.Tensor,
+        obstacle_pos: torch.Tensor,
+        obstacle_radius: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Computes velᵀ ∇²h vel for the active CBF constraint.
+        Obstacles: (||vel||² - (∇h·vel)²) / dist  (curvature of signed distance)
+        Walls: 0  (linear constraints, zero Hessian)
+        """
+        device = robot_pos.device
+        dtype = robot_pos.dtype
+        num_envs = robot_pos.shape[0]
+
+        if obstacle_radius is None:
+            obstacle_radius = self._obstacle_radii
+
+        has_obstacles = obstacle_pos is not None and obstacle_pos.shape[1] > 0
+        if has_obstacles:
+            distances = torch.linalg.norm(robot_pos.unsqueeze(1) - obstacle_pos, dim=2)
+            h_obs_all = distances - (self.robot_radius + obstacle_radius)
+            min_h_obs, min_idx = torch.min(h_obs_all, dim=1)
+            d_active = distances[torch.arange(num_envs, device=device), min_idx].clamp_min(1e-8)
+            closest_obs = obstacle_pos[torch.arange(num_envs, device=device), min_idx]
+            n_obs = (robot_pos - closest_obs) / d_active.unsqueeze(1)
+            v_dot_n = torch.sum(robot_vel * n_obs, dim=1)
+            lf2h_obs = (torch.sum(robot_vel ** 2, dim=1) - v_dot_n ** 2) / d_active
+        else:
+            min_h_obs = torch.full((num_envs,), float("inf"), device=device, dtype=dtype)
+            lf2h_obs = torch.zeros(num_envs, device=device, dtype=dtype)
+
+        x, y = robot_pos[:, 0], robot_pos[:, 1]
+        h_walls = torch.stack([
+            x - self.robot_radius,
+            (self.world_size - x) - self.robot_radius,
+            y - self.robot_radius,
+            (self.world_size - y) - self.robot_radius,
+        ], dim=1)
+        min_h_wall, _ = torch.min(h_walls, dim=1)
+
+        if has_obstacles:
+            use_obs = min_h_obs <= min_h_wall
+            return torch.where(use_obs, lf2h_obs, torch.zeros(num_envs, device=device, dtype=dtype))
+        return torch.zeros(num_envs, device=device, dtype=dtype)
+
     def filter_velocity(
         self,
         robot_pos: torch.Tensor,
-        velocity: torch.Tensor,
+        vel: torch.Tensor,
         obstacle_pos: torch.Tensor,
         obstacle_radius: torch.Tensor,
-    ) -> torch.Tensor:
+        alpha: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Filters the velocity to satisfy the combined CBF (obstacles + walls) constraint
-        using the closed-form solution for single-integrator dynamics with alpha(h)=h.
+        Filters velocity for single-integrator (quasi-static) dynamics using a relative-degree-1 CBF.
+
+        Enforces: ∇h · vel + alpha * h ≥ 0
+
+        Returns (filtered_vel, psi) where psi = ∇h · vel + alpha * h before filtering.
+        psi > 0 means safe.
         """
-        # Combined h and gradient (accounts for both obstacles and walls)
-        h = self.h_function(robot_pos, obstacle_pos, obstacle_radius)            # (num_envs,)
-        grad_h = self.gradient_h_function(robot_pos, obstacle_pos)               # (num_envs,2)
+        h = self.h_function(robot_pos, obstacle_pos, obstacle_radius)  # (num_envs,)
+        grad_h = self.gradient_h_function(robot_pos, obstacle_pos, obstacle_radius)  # (num_envs, 2)
 
-        # Closed form correction: enforce grad_h @ u + h >= 0
-        u_des = velocity
-        Lgh_u_des = torch.sum(grad_h * u_des, dim=1)                             # (num_envs,)
-        psi = Lgh_u_des + h                                                      # (num_envs,)
+        Lfh = torch.sum(grad_h * vel, dim=1)   # ∇h · vel
+        psi = Lfh + alpha * h                  # (num_envs,)
 
-        filtered_velocity = velocity.clone()
-        filtered_ids = torch.where(psi < 0)[0]
+        filtered_vel = vel.clone()
+        violated = torch.where(psi < 0)[0]
+        if violated.numel() > 0:
+            denom = torch.sum(grad_h[violated] ** 2, dim=1).clamp_min(1e-12)
+            correction = (-psi[violated] / denom).unsqueeze(1) * grad_h[violated]
+            filtered_vel[violated] += correction
+
+        return filtered_vel, psi
+
+    def filter_acceleration(
+        self,
+        robot_pos: torch.Tensor,
+        robot_vel: torch.Tensor,
+        accel: torch.Tensor,
+        obstacle_pos: torch.Tensor,
+        obstacle_radius: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Filters acceleration for double-integrator dynamics using a relative-degree-2 CBF.
+
+        Defines ψ₁ = ∇h·vel + h.
+        Enforces ψ̇₁ + ψ₁ ≥ 0, which expands to:
+            ∇h·acc + velᵀ∇²h·vel + 2(∇h·vel) + h ≥ 0
+
+        Returns (filtered_accel, ψ₁). ψ₁ > 0 means safe.
+        """
+        h = self.h_function(robot_pos, obstacle_pos, obstacle_radius)                          # (num_envs,)
+        grad_h = self.gradient_h_function(robot_pos, obstacle_pos, obstacle_radius)          # (num_envs, 2)
+        lf2h = self._hessian_vel_term(robot_pos, robot_vel, obstacle_pos, obstacle_radius)  # (num_envs,)
+
+        Lfh = torch.sum(grad_h * robot_vel, dim=1)                            # ∇h·vel
+        psi1 = Lfh + h                                                        # composite barrier
+
+        # slack < 0 means the desired accel violates the constraint
+        slack = torch.sum(grad_h * accel, dim=1) + lf2h + 2 * Lfh + h       # (num_envs,)
+
+        filtered_accel = accel.clone()
+        filtered_ids = torch.where(slack < 0)[0]
         if filtered_ids.numel() > 0:
-            denom = torch.sum(grad_h[filtered_ids] ** 2, dim=1).clamp_min(1e-12) # (k,)
-            correction = (-psi[filtered_ids] / denom).unsqueeze(1) * grad_h[filtered_ids]
-            filtered_velocity[filtered_ids] += correction
+            denom = torch.sum(grad_h[filtered_ids] ** 2, dim=1).clamp_min(1e-12)
+            correction = (-slack[filtered_ids] / denom).unsqueeze(1) * grad_h[filtered_ids]
+            filtered_accel[filtered_ids] += correction
 
-        return filtered_velocity, psi
+        return filtered_accel, psi1
 
     def step(self, action: torch.Tensor):
         """
         Executes one time step in the environment using PyTorch tensors.
 
-        Args:
-            action: Tensor of shape (num_envs, num_actions) on self.device.
-
-        Returns:
-            obs: Observation tensor (num_envs, obs_dim).
-            reward: Reward tensor (num_envs,).
-            done: Done tensor (num_envs,).
-            extras: Dictionary containing detailed observation, info, log, and episode data (tensors).
+        action: (num_envs, num_actions) = (P*A, num_actions)
+        Returns obs (P*A, obs_dim), reward (P*A,), done (P*A,), extras.
         """
-        # Action is expected to be a tensor on self.device
         if action.device != self.device:
             action = action.to(self.device)
 
-        # 1. Apply Action & Update State (using tensor operations)
-        clipped_action = torch.clamp(action, -self.max_velocity, self.max_velocity)
-        # Always filter velocity to compute psi for potential reward
-        filtered_action, psi = self.filter_velocity(
-            self._robot_pos,
-            clipped_action,
-            self._obstacle_positions,
-            self._obstacle_radii,
-        )
+        P, A = self._num_parallel_envs, self.num_agents
+        N = P * A
 
-        if self.use_cbf_action_filtering:
-            self._last_velocity = filtered_action
-        else:
-            self._last_velocity = clipped_action
-        prev_dist_to_goal = torch.linalg.norm(self._robot_pos - self._goal_pos, dim=1)
+        # prev distances before update: (P, A)
+        prev_dist_to_goal = torch.linalg.norm(self._robot_pos - self._goal_pos, dim=2)
 
-        rand_velocity = torch.randn_like(self._last_velocity) * self.max_velocity * self.noise_level
-        new_pos = self._robot_pos + (self._last_velocity + rand_velocity) * self.dt
-        # Clamp position to stay within world boundaries (center of robot)
-        # Note: Clamping here prevents the *center* from going out, but collision check below handles radius overlap
-        self._robot_pos = torch.clamp(
-            new_pos,
-            0.0,  # Clamp center to 0
-            self.world_size,  # Clamp center to world_size
-        )
-        self._elapsed_steps += 1
-        self.episode_length_buf = self._elapsed_steps.clone().int()  # Update buffer
+        # Reshape action (P*A, 2) -> (P, A, 2) for per-agent processing
+        action_3d = action.reshape(P, A, self.num_actions)
 
-        # --- Vectorized termination/collision/goal logic (using tensor operations) ---
-        terminated = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        collided_obstacle = torch.zeros_like(terminated)  # Renamed from collided
-        goal_reached = torch.zeros_like(terminated)
-        wall_collision = torch.zeros_like(terminated)  # New tensor for wall collision
+        new_pos_list = []
+        new_vel_list = []
+        psi_list = []
+        filtered_list = []
+        clipped_list = []
 
-        # Obstacle Collision check
+        for a in range(A):
+            agent_pos = self._robot_pos[:, a, :]   # (P, 2)
+            agent_vel = self._robot_vel[:, a, :]   # (P, 2)
+            agent_act = action_3d[:, a, :]         # (P, 2)
+
+            # Frozen agents (individually done but world episode not over) stay put.
+            is_frozen = self._world_agents_done_buf[:, a]  # (P,)
+            agent_act = torch.where(is_frozen.unsqueeze(1), torch.zeros_like(agent_act), agent_act)
+
+            # Extend obstacle set with other agents as dynamic obstacles
+            if A > 1:
+                other_pos = torch.cat(
+                    [self._robot_pos[:, :a, :], self._robot_pos[:, a+1:, :]], dim=1
+                )  # (P, A-1, 2)
+                other_radii = torch.full(
+                    (P, A - 1), self.robot_radius, dtype=torch.float32, device=self.device
+                )
+                ext_obs_pos = torch.cat([self._obstacle_positions, other_pos], dim=1)
+                ext_obs_radii = torch.cat([self._obstacle_radii, other_radii], dim=1)
+            else:
+                ext_obs_pos = self._obstacle_positions
+                ext_obs_radii = self._obstacle_radii
+
+            if self.dynamics_model == "quasi_static":
+                clipped = torch.clamp(agent_act, -self.max_velocity, self.max_velocity)
+                filtered, psi = self.filter_velocity(
+                    agent_pos, clipped, ext_obs_pos, ext_obs_radii
+                )
+                applied = filtered if self.use_cbf_action_filtering else clipped
+                noise = torch.randn_like(applied) * self.max_velocity * self.noise_level
+                new_pos = torch.clamp(
+                    agent_pos + (applied + noise) * self.dt, 0.0, self.world_size
+                )
+                new_vel = applied
+            else:
+                clipped = torch.clamp(agent_act, -self.max_acceleration, self.max_acceleration)
+                filtered, psi = self.filter_acceleration(
+                    agent_pos, agent_vel, clipped, ext_obs_pos, ext_obs_radii
+                )
+                applied = filtered if self.use_cbf_action_filtering else clipped
+                new_vel = torch.clamp(
+                    agent_vel + applied * self.dt, -self.max_velocity, self.max_velocity
+                )
+                noise = torch.randn_like(new_vel) * self.max_velocity * self.noise_level
+                new_pos = torch.clamp(
+                    agent_pos + (new_vel + noise) * self.dt, 0.0, self.world_size
+                )
+
+            # Frozen agents: restore original position and zero velocity
+            new_pos = torch.where(is_frozen.unsqueeze(1), agent_pos, new_pos)
+            new_vel = torch.where(is_frozen.unsqueeze(1), torch.zeros_like(new_vel), new_vel)
+            clipped = torch.where(is_frozen.unsqueeze(1), torch.zeros_like(clipped), clipped)
+            filtered = torch.where(is_frozen.unsqueeze(1), torch.zeros_like(filtered), filtered)
+            psi = torch.where(is_frozen, torch.zeros_like(psi), psi)
+
+            new_pos_list.append(new_pos)
+            new_vel_list.append(new_vel)
+            psi_list.append(psi)
+            filtered_list.append(filtered)
+            clipped_list.append(clipped)
+
+        # Update state: stack per-agent results -> (P, A, 2)
+        self._robot_pos = torch.stack(new_pos_list, dim=1)
+        self._robot_vel = torch.stack(new_vel_list, dim=1)
+        # Only increment elapsed steps for non-frozen agents
+        not_frozen_flat = ~self._world_agents_done_buf.reshape(N)
+        self._elapsed_steps[not_frozen_flat] += 1
+        self.episode_length_buf = self._elapsed_steps.clone().int()
+
+        # Flat views for termination / reward (all in N = P*A space)
+        robot_pos_flat = self._robot_pos.reshape(N, 2)
+        goal_pos_flat = self._goal_pos.reshape(N, 2)
+        prev_dist_flat = prev_dist_to_goal.reshape(N)
+        current_dist_flat = torch.linalg.norm(robot_pos_flat - goal_pos_flat, dim=1)
+
+        # psi, filtered, clipped: stack (P,) per agent -> (P, A) -> (N,)
+        psi_flat = torch.stack(psi_list, dim=1).reshape(N) if not isinstance(psi_list[0], int) else torch.zeros(N, device=self.device)
+        filtered_flat = torch.stack(filtered_list, dim=1).reshape(N, self.num_actions)
+        clipped_flat = torch.stack(clipped_list, dim=1).reshape(N, self.num_actions)
+
+        # --- Termination ---
+        terminated = torch.zeros(N, dtype=torch.bool, device=self.device)
+        collided_obstacle = torch.zeros(N, dtype=torch.bool, device=self.device)
+        wall_collision = torch.zeros(N, dtype=torch.bool, device=self.device)
+
+        # Static obstacle collision (flat)
         if self.num_obstacles > 0:
-            # Expand dims for broadcasting:
-            # robot_pos: (num_envs, 1, 2)
-            # obstacle_pos: (num_envs, num_obstacles, 2)
-            # obstacle_radii: (num_envs, num_obstacles) - No expansion needed
-            robot_pos_exp = self._robot_pos.unsqueeze(1)
-            obstacle_pos_exp = self._obstacle_positions
-            obstacle_radii_exp = (
+            obs_pos_flat = (
+                self._obstacle_positions
+                .unsqueeze(1).expand(P, A, self.num_obstacles, 2)
+                .reshape(N, self.num_obstacles, 2)
+            )
+            obs_radii_flat = (
                 self._obstacle_radii
-            )  # Already (num_envs, num_obstacles)
+                .unsqueeze(1).expand(P, A, self.num_obstacles)
+                .reshape(N, self.num_obstacles)
+            )
+            dist_sq = torch.sum(
+                (robot_pos_flat.unsqueeze(1) - obs_pos_flat) ** 2, dim=2
+            )
+            thresh_sq = (self.robot_radius + obs_radii_flat) ** 2
+            collided_obstacle = torch.any(dist_sq < thresh_sq, dim=1)
+            terminated |= collided_obstacle
 
-            # Calculate distances: (num_envs, num_obstacles)
-            distances_sq = torch.sum((robot_pos_exp - obstacle_pos_exp) ** 2, dim=2)
-            # Collision thresholds: (num_envs, num_obstacles)
-            collision_thresholds = (
-                self.robot_radius + obstacle_radii_exp
-            ) ** 2  # Use per-env radii
-            # Check collision: (num_envs, num_obstacles)
-            collisions_per_obstacle = distances_sq < collision_thresholds
-            # Any collision per env: (num_envs,)
-            collided_obstacle = torch.any(collisions_per_obstacle, dim=1)
-            terminated = (
-                terminated | collided_obstacle
-            )  # Update terminated based on obstacle collision
+        # Agent-agent collision (skip pairs where either agent is already frozen at its goal)
+        if A > 1:
+            arange_P = torch.arange(P, device=self.device)
+            for ai in range(A):
+                for aj in range(ai + 1, A):
+                    dist_ij = torch.linalg.norm(
+                        self._robot_pos[:, ai, :] - self._robot_pos[:, aj, :], dim=1
+                    )  # (P,)
+                    collision_ij = dist_ij < 2 * self.robot_radius
+                    # Frozen agents have already completed their task — ignore collisions with them.
+                    collision_ij = collision_ij & ~self._world_agents_done_buf[:, ai] & ~self._world_agents_done_buf[:, aj]
+                    flat_i = arange_P * A + ai
+                    flat_j = arange_P * A + aj
+                    terminated[flat_i] |= collision_ij
+                    terminated[flat_j] |= collision_ij
+                    collided_obstacle[flat_i] |= collision_ij
+                    collided_obstacle[flat_j] |= collision_ij
 
-        # Wall Collision check
-        # Check if robot center is too close to any boundary
+        # Wall collision
         wall_collision = (
-            (self._robot_pos[:, 0] < self.robot_radius)
-            | (self._robot_pos[:, 0] > self.world_size - self.robot_radius)
-            | (self._robot_pos[:, 1] < self.robot_radius)
-            | (self._robot_pos[:, 1] > self.world_size - self.robot_radius)
+            (robot_pos_flat[:, 0] < self.robot_radius)
+            | (robot_pos_flat[:, 0] > self.world_size - self.robot_radius)
+            | (robot_pos_flat[:, 1] < self.robot_radius)
+            | (robot_pos_flat[:, 1] > self.world_size - self.robot_radius)
         )
-        # Only count wall collision if not already terminated by obstacle
         wall_collision = wall_collision & (~terminated)
-        terminated = (
-            terminated | wall_collision
-        )  # Update terminated based on wall collision
+        terminated |= wall_collision
 
         # Goal check
-        current_dist_to_goal = torch.linalg.norm(
-            self._robot_pos - self._goal_pos, dim=1
-        )
-        goal_reached = current_dist_to_goal < (self.robot_radius + self.goal_radius)
-        # Only count goal reached if not already terminated by collision (obstacle or wall)
+        goal_reached = current_dist_flat < (self.robot_radius + self.goal_radius)
         goal_reached = goal_reached & (~terminated)
-        terminated = terminated | goal_reached  # Update terminated based on goal
+        terminated |= goal_reached
 
-        # --- Vectorized reward calculation (using tensor operations) ---
-        # Normalize rewards: Goal=1.0, Collisions=-1.0
-        reward_goal = goal_reached.float() * 1.0  # Normalized goal reward
-        reward_obstacle_collision = (
-            collided_obstacle.float() * -1.0
-        )  # Normalized obstacle collision penalty
-        reward_wall_collision = (
-            wall_collision.float() * -1.0
-        )  # Normalized wall collision penalty
-        
-
-        # Progress reward: Normalize by max possible progress per step
-        active_mask = ~terminated  # Mask for steps not ended by collision or goal
-        max_progress_per_step = (
-            self.max_velocity * self.dt + 1e-8
-        )  # Add epsilon for stability
-        reward_progress = 20 * (
-            (prev_dist_to_goal - current_dist_to_goal) / max_progress_per_step
-        ) * active_mask.float()
-
-        # Step penalty: Small negative value relative to normalized rewards
+        # --- Rewards ---
+        active_mask = ~terminated
+        reward_goal = goal_reached.float()
+        reward_obstacle_collision = collided_obstacle.float() * -1.0
+        reward_wall_collision = wall_collision.float() * -1.0
+        max_progress_per_step = self.max_velocity * self.dt + 1e-8
+        reward_progress = (
+            20 * (prev_dist_flat - current_dist_flat) / max_progress_per_step
+            * active_mask.float()
+        )
         reward_step_penalty = -0.01 * active_mask.float()
 
         if self.use_cbf_reward_penalty:
-            # add a reward that encourage clipped_action to be close to filtered_action
-            reward_clipped_action = 100 * (torch.exp(
-                -torch.sum(torch.square(clipped_action - filtered_action), dim=1) / 0.25
-            ) * active_mask.float() - 1)
-            if type(psi) == int or isinstance(psi, int):
-                psi = torch.tensor(psi, dtype=torch.float32, device=clipped_action.device)
-            reward_psi = torch.clamp(psi, max=0.0) * active_mask.float() * 10
+            reward_clipped_action = 100 * (
+                torch.exp(
+                    -torch.sum(torch.square(clipped_flat - filtered_flat), dim=1) / 0.25
+                ) * active_mask.float() - 1
+            )
+            reward_psi = torch.clamp(psi_flat, max=0.0) * active_mask.float() * 10
         else:
-            reward_clipped_action = torch.zeros_like(reward_goal)
-            reward_psi = torch.zeros_like(reward_goal)
+            reward_clipped_action = torch.zeros(N, device=self.device)
+            reward_psi = torch.zeros(N, device=self.device)
 
         reward = (
             reward_goal
@@ -794,76 +1024,88 @@ class UnifiedNavigationEnv(VecEnv):
             + reward_clipped_action
             + reward_psi
         )
+        reward_log = reward - reward_psi
 
-        reward_log = (
-            reward_goal
-            + reward_obstacle_collision
-            + reward_wall_collision
-            + reward_progress
-            + reward_step_penalty
-            + reward_clipped_action
-            # + reward_psi
-        )
-
-        # --- Truncation ---
-        truncated = torch.zeros_like(terminated)
+        # --- Truncation (only for non-frozen agents) ---
+        truncated = torch.zeros(N, dtype=torch.bool, device=self.device)
         if self._max_episode_steps is not None:
             truncated = self._elapsed_steps >= self._max_episode_steps
-        # Reset episode length buffer for terminated/truncated envs
-        self.episode_length_buf[terminated | truncated] = 0
-        # Reset elapsed steps for terminated/truncated envs
-        self._elapsed_steps[terminated | truncated] = 0
+        # Don't re-truncate already-frozen agents
+        truncated = truncated & not_frozen_flat
         timeout_mask = truncated & (~terminated)
         reward_timeout = timeout_mask.float() * -10.0
-        reward = reward + reward_timeout  # apply timeout penalty
+        reward = reward + reward_timeout
+
+        # --- World-level termination ---
+        # Mark agents that just individually terminated this step.
+        agent_individually_done = terminated | truncated
+        self._world_agents_done_buf |= agent_individually_done.reshape(P, A)
+
+        # Update goal-reach buffer (needed for success check).
+        self._agents_reached_goal_buf |= goal_reached.reshape(P, A)
+
+        # A world fails when any agent has a non-goal termination.
+        world_any_fail = (
+            (collided_obstacle | wall_collision | timeout_mask).reshape(P, A)
+        ).any(dim=1)  # (P,)
+
+        # World episode ends when every agent has individually terminated OR any agent failed.
+        world_episode_done = self._world_agents_done_buf.all(dim=1) | world_any_fail  # (P,)
+
+        # World success = world done AND all agents reached goal AND no failures.
+        world_success = world_episode_done & self._agents_reached_goal_buf.all(dim=1) & ~world_any_fail
+
+        # Clear buffers for worlds whose episode just ended.
+        self._world_agents_done_buf[world_episode_done] = False
+        self._agents_reached_goal_buf[world_episode_done | world_any_fail] = False
+
+        # Expand to flat (P*A,) for logging and done signal.
+        world_success_flat = world_success.unsqueeze(1).expand(P, A).reshape(N)
+        world_episode_done_flat = world_episode_done.unsqueeze(1).expand(P, A).reshape(N)
+
+        # done fires for ALL agents in a world simultaneously.
+        done = world_episode_done_flat
+        self.episode_length_buf[done] = 0
+        self._elapsed_steps[done] = 0
 
         # --- Prepare outputs ---
-        obs, extras = self.get_observations()  # Get tensor obs and extras dict
-        done = terminated | truncated  # Combine termination and truncation
+        obs, extras = self.get_observations()
 
-        # Add specific log items expected by runner (as tensors)
         extras["log"] = {
             "reward_goal": reward_goal,
             "reward_obstacle_collision": reward_obstacle_collision,
-            "reward_wall_collision": reward_wall_collision,  # Add wall collision reward log
+            "reward_wall_collision": reward_wall_collision,
             "reward_progress": reward_progress,
             "reward_step_penalty": reward_step_penalty,
             "reward_psi": reward_psi,
             "reward_clipped_action": reward_clipped_action,
             "reward_timeout": reward_timeout,
-            "success": goal_reached.float(),  # Use float for logging
-            "collided_obstacle": collided_obstacle.float(),  # Renamed log key
-            "collided_wall": wall_collision.float(),  # Add wall collision status log
-            "reward_clipped_action": clipped_action,  #.float(),  # Add clipped action log
-            "psi": psi
+            "success": world_success_flat.float(),
+            "collided_obstacle": collided_obstacle.float(),
+            "collided_wall": wall_collision.float(),
+            "psi": psi_flat,
         }
-        # Add episode info for runner logging (as tensors)
         extras["episode"] = {
-            "reward": reward,  # Total reward per step
+            "reward": reward,
             "reward_log": reward_log,
-            "length": self.episode_length_buf,  # Current episode length (already updated)
+            "length": self.episode_length_buf,
             "reward_goal": reward_goal,
             "reward_obstacle_collision": reward_obstacle_collision,
-            "reward_wall_collision": reward_wall_collision,  # Add wall collision reward log
+            "reward_wall_collision": reward_wall_collision,
             "reward_progress": reward_progress,
             "reward_step_penalty": reward_step_penalty,
             "reward_clipped_action": reward_clipped_action,
             "reward_psi": reward_psi,
             "reward_timeout": reward_timeout,
-            "success": goal_reached.float(),  # Use float for logging
-            "collided_obstacle": collided_obstacle.float(),  # Renamed log key
-            "collided_wall": wall_collision.float(),  # Add wall collision status log
-            "clipped_action": clipped_action,  # Add clipped action log
-            
+            "success": world_success_flat.float(),
+            "collided_obstacle": collided_obstacle.float(),
+            "collided_wall": wall_collision.float(),
         }
 
-        # Reset environments that are done
-        # Note: rsl_rl typically handles resets externally based on 'done' flags.
-        # If internal reset is needed, it would go here, potentially using indices from `done`.
         reset_indices = torch.where(done)[0]
         if len(reset_indices) > 0:
-            self._reset_envs(reset_indices) # Need a helper function for partial resets
-        
+            self._reset_envs(reset_indices)
+
         if self.render_mode == "human":
             self._render_frame()
 
@@ -912,56 +1154,67 @@ class UnifiedNavigationEnv(VecEnv):
             self.ax.set_ylabel("Y Position")
 
             # Create patches (visual elements) only once
-            self.robot_patch = patches.Circle(
-                (0, 0), self.robot_radius, fc="blue", alpha=0.8, label="Robot"
-            )
-            self.goal_patch = patches.Circle(
-                (0, 0), self.goal_radius, fc="green", alpha=0.8, label="Goal"
-            )
-            # Create obstacle patches using radii from the *first* environment for visualization
-            first_env_radii_np = self._obstacle_radii_np[0]  # Shape (num_obstacles,)
+            # One robot + goal patch per agent; colors cycle through blue shades
+            agent_colors = ["blue", "royalblue", "deepskyblue", "steelblue",
+                            "dodgerblue", "cornflowerblue", "mediumblue", "navy"]
+            goal_colors = ["green", "limegreen", "forestgreen", "darkgreen",
+                           "mediumseagreen", "springgreen", "olivedrab", "teal"]
+            A = self.num_agents
+            self.robot_patch = [
+                patches.Circle(
+                    (0, 0), self.robot_radius,
+                    fc=agent_colors[a % len(agent_colors)], alpha=0.8,
+                    label=f"Robot {a}" if a == 0 else f"Robot {a}",
+                )
+                for a in range(A)
+            ]
+            self.goal_patch = [
+                patches.Circle(
+                    (0, 0), self.goal_radius,
+                    fc=goal_colors[a % len(goal_colors)], alpha=0.8,
+                    label=f"Goal {a}" if a == 0 else f"Goal {a}",
+                )
+                for a in range(A)
+            ]
+            first_env_radii_np = self._obstacle_radii_np[0]
             self.obstacle_patches = [
                 patches.Circle((0, 0), radius, fc="red", alpha=0.6)
-                for radius in first_env_radii_np  # Use numpy version for env 0
+                for radius in first_env_radii_np
             ]
 
-            self.ax.add_patch(self.robot_patch)
-            self.ax.add_patch(self.goal_patch)
+            for p in self.robot_patch:
+                self.ax.add_patch(p)
+            for p in self.goal_patch:
+                self.ax.add_patch(p)
             for patch in self.obstacle_patches:
                 self.ax.add_patch(patch)
             self.ax.legend(loc="upper right")
 
         # --- Update patch positions based on current state ---
-        # Ensure state variables are initialized (should be after reset)
         if (
             self._robot_pos is None
             or self._goal_pos is None
             or self._obstacle_positions is None
         ):
             print("Warning: Attempting to render before reset() or with invalid state.")
-            # Handle gracefully, e.g., return None or render default positions
             if self.render_mode == "rgb_array":
-                return np.zeros((100, 100, 3), dtype=np.uint8)  # Placeholder
+                return np.zeros((100, 100, 3), dtype=np.uint8)
             else:
                 return None
 
-        # Convert tensors to NumPy for rendering (only for the first env if num_envs > 1)
-        robot_pos_np = self._robot_pos[0].cpu().numpy()
-        goal_pos_np = self._goal_pos[0].cpu().numpy()
-        obstacle_positions_np = (
-            self._obstacle_positions[0].cpu().numpy()
-        )  # Shape (num_obstacles, 2)
-        # Radii are already set in the patches during initialization based on env 0
+        # Render world 0: _robot_pos[0] is (A, 2), _goal_pos[0] is (A, 2)
+        robot_pos_np = self._robot_pos[0].cpu().numpy()       # (A, 2)
+        goal_pos_np = self._goal_pos[0].cpu().numpy()          # (A, 2)
+        obstacle_positions_np = self._obstacle_positions[0].cpu().numpy()  # (O, 2)
 
-        self.robot_patch.set_center(robot_pos_np)
-        self.goal_patch.set_center(goal_pos_np)
+        for a in range(self.num_agents):
+            self.robot_patch[a].set_center(robot_pos_np[a])
+            self.goal_patch[a].set_center(goal_pos_np[a])
         for i, patch in enumerate(self.obstacle_patches):
             if i < self.num_obstacles:
                 patch.set_center(obstacle_positions_np[i])
             else:
-                # If there are fewer obstacles than patches, set remaining patches to a default position
                 patch.set_center((0, 0))
-        # No need to update obstacle patch positions, they are set during init
 
         # --- Draw and return/display (unchanged) ---
         if self.render_mode == "human":
@@ -982,63 +1235,82 @@ class UnifiedNavigationEnv(VecEnv):
     
     def _reset_envs(self, reset_indices: torch.Tensor):
         """
-        Resets only the environments specified by reset_indices.
+        Resets only the (virtual) environments specified by reset_indices.
 
-        Args:
-            reset_indices: 1D torch.Tensor of indices to reset (on CPU or self.device).
+        reset_indices are in flat space [0, P*A). For multi-agent envs,
+        vi = world_e * A + agent_a, so we re-place only the specific agent
+        while keeping other agents and shared obstacles unchanged.
         """
         if not isinstance(reset_indices, torch.Tensor):
             reset_indices = torch.tensor(reset_indices, dtype=torch.long)
-        reset_indices = reset_indices.cpu().numpy()  # For numpy indexing
+        reset_indices_np = reset_indices.cpu().numpy()
 
-        # Use NumPy for placement logic, then convert to tensors
-        robot_pos_np = self._robot_pos.cpu().numpy()
-        goal_pos_np = self._goal_pos.cpu().numpy()
-        obstacle_positions_np = self._obstacle_positions.cpu().numpy()
-        obstacle_radii_np = self._obstacle_radii.cpu().numpy()
+        A = self.num_agents
+        robot_pos_np = self._robot_pos.cpu().numpy()      # (P, A, 2)
+        goal_pos_np = self._goal_pos.cpu().numpy()         # (P, A, 2)
+        obstacle_positions_np = self._obstacle_positions.cpu().numpy()  # (P, O, 2)
+        obstacle_radii_np = self._obstacle_radii.cpu().numpy()          # (P, O)
 
-        for env_idx in reset_indices:
+        for vi in reset_indices_np:
+            world_e = int(vi) // A
+            agent_a = int(vi) % A
+
+            obs_pos = obstacle_positions_np[world_e]
+            current_env_obstacle_radii = obstacle_radii_np[world_e]
+            # Positions of sibling agents (keep them as obstacles for clearance check)
+            sibling_positions = np.concatenate(
+                [robot_pos_np[world_e, :agent_a, :],
+                 robot_pos_np[world_e, agent_a + 1:, :]], axis=0
+            )  # (A-1, 2)
+
             placement_attempts = 0
             max_placement_attempts = 100
             valid_placement = False
-            min_obstacle_separation_buffer = 0.5
             min_robot_goal_distance = self.world_size / 3.0
-            current_env_obstacle_radii = obstacle_radii_np[env_idx]
-            current_env_max_obstacle_radius = (
-                np.max(current_env_obstacle_radii) if self.num_obstacles > 0 else 0.0
-            )
+            goal_wall_buffer = max(self.goal_radius, self.robot_radius)
+            robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+            wall_buffer = self.robot_radius + 1.0
+
+            new_robot_pos = robot_pos_np[world_e, agent_a].copy()
+            new_goal_pos = goal_pos_np[world_e, agent_a].copy()
 
             while not valid_placement and placement_attempts < max_placement_attempts:
                 placement_attempts += 1
 
-                # 1. Place Obstacles (using NumPy)
-                if self.num_obstacles > 0:
-                    obs_pos = np.random.uniform(
-                        0 + current_env_max_obstacle_radius,
-                        self.world_size - current_env_max_obstacle_radius,
-                        size=(self.num_obstacles, 2),
-                    ).astype(np.float32)
-                else:
-                    obs_pos = np.empty((0, 2), dtype=np.float32)
-
-                # 2. Place Goal (using NumPy) with wall buffer
-                goal_wall_buffer = max(self.goal_radius, self.robot_radius)
+                # Place goal
                 goal_pos = np.random.uniform(
-                    0 + goal_wall_buffer,
-                    self.world_size - goal_wall_buffer,
-                    size=(2,),
+                    goal_wall_buffer, self.world_size - goal_wall_buffer, size=(2,)
                 ).astype(np.float32)
+                goal_hsafe = True
+                if (
+                    (goal_pos[0] < self.robot_radius)
+                    or (goal_pos[0] > self.world_size - self.robot_radius)
+                    or (goal_pos[1] < self.robot_radius)
+                    or (goal_pos[1] > self.world_size - self.robot_radius)
+                ):
+                    goal_hsafe = False
+                if goal_hsafe and self.num_obstacles > 0:
+                    for i, o_pos in enumerate(obs_pos):
+                        if np.linalg.norm(goal_pos - o_pos) < (
+                            self.robot_radius + current_env_obstacle_radii[i]
+                        ):
+                            goal_hsafe = False
+                            break
+                if goal_hsafe and self.num_obstacles > 0:
+                    for i, o_pos in enumerate(obs_pos):
+                        if np.linalg.norm(goal_pos - o_pos) < (
+                            self.goal_radius + current_env_obstacle_radii[i]
+                        ):
+                            goal_hsafe = False
+                            break
+                if not goal_hsafe:
+                    continue
 
-                # 3. Place Robot (using NumPy) ensuring h_wall > 1.0
-                robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+                # Place robot
                 robot_pos = np.random.uniform(
-                    0 + robot_wall_buffer,
-                    self.world_size - robot_wall_buffer,
-                    size=(2,),
+                    robot_wall_buffer, self.world_size - robot_wall_buffer, size=(2,)
                 ).astype(np.float32)
 
-                # Ensure robot h > 1.0 wrt walls (strict)
-                wall_buffer = self.robot_radius + 1.0
                 if (
                     (robot_pos[0] <= wall_buffer)
                     or (robot_pos[0] >= self.world_size - wall_buffer)
@@ -1047,7 +1319,6 @@ class UnifiedNavigationEnv(VecEnv):
                 ):
                     continue
 
-                # Robot vs Obstacles (strict > r_robot + r_obst + 1.0)
                 robot_clear = True
                 for i, o_pos in enumerate(obs_pos):
                     if (
@@ -1059,103 +1330,59 @@ class UnifiedNavigationEnv(VecEnv):
                 if not robot_clear:
                     continue
 
-                robot_goal_dist = np.linalg.norm(robot_pos - goal_pos)
-                if robot_goal_dist < min_robot_goal_distance:
-                    continue
-
-                # New: ensure goal is in an area where CBF h >= 0 (safe w.r.t. obstacles and walls)
-                goal_hsafe = True
-                if (
-                    (goal_pos[0] < self.robot_radius)
-                    or (goal_pos[0] > self.world_size - self.robot_radius)
-                    or (goal_pos[1] < self.robot_radius)
-                    or (goal_pos[1] > self.world_size - self.robot_radius)
-                ):
-                    goal_hsafe = False
-                if goal_hsafe and self.num_obstacles > 0:
-                    for i, o_pos in enumerate(obs_pos):
-                        if (
-                            np.linalg.norm(goal_pos - o_pos)
-                            < (self.robot_radius + current_env_obstacle_radii[i])
-                        ):
-                            goal_hsafe = False
-                            break
-                if not goal_hsafe:
-                    continue
-
-                goal_clear_obstacles = True
-                for i, o_pos in enumerate(obs_pos):
-                    if (
-                        np.linalg.norm(goal_pos - o_pos)
-                        < self.goal_radius + current_env_obstacle_radii[i]
-                    ):
-                        goal_clear_obstacles = False
+                # Clearance from sibling agents
+                for sib in sibling_positions:
+                    if np.linalg.norm(robot_pos - sib) <= 2 * self.robot_radius + 1.0:
+                        robot_clear = False
                         break
-                if not goal_clear_obstacles:
+                if not robot_clear:
                     continue
 
-                obstacles_clear = True
-                if self.num_obstacles > 1:
-                    for i in range(self.num_obstacles):
-                        for j in range(i + 1, self.num_obstacles):
-                            dist_sq = np.sum((obs_pos[i] - obs_pos[j]) ** 2)
-                            min_dist_sq = (
-                                current_env_obstacle_radii[i]
-                                + current_env_obstacle_radii[j]
-                                + min_obstacle_separation_buffer
-                            ) ** 2
-                            if dist_sq < min_dist_sq:
-                                obstacles_clear = False
-                                break
-                        if not obstacles_clear:
-                            break
-                    if not obstacles_clear:
-                        continue
+                if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
+                    continue
 
-                obstacle_blocks_path = False
+                # Obstacle blocks path check
                 if self.num_obstacles > 0:
-                    dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
+                    dist_rg = np.linalg.norm(robot_pos - goal_pos)
+                    blocks = False
                     for i, o_pos in enumerate(obs_pos):
-                        dist_robot_obs = np.linalg.norm(robot_pos - o_pos)
-                        dist_goal_obs = np.linalg.norm(goal_pos - o_pos)
                         if (
-                            abs(dist_robot_obs + dist_goal_obs - dist_robot_goal)
+                            abs(
+                                np.linalg.norm(robot_pos - o_pos)
+                                + np.linalg.norm(goal_pos - o_pos)
+                                - dist_rg
+                            )
                             < current_env_obstacle_radii[i] * 2
                         ):
-                            obstacle_blocks_path = True
+                            blocks = True
                             break
-                    if not obstacle_blocks_path:
+                    if not blocks:
                         continue
-                else:
-                    obstacle_blocks_path = True
 
-                # Pass
+                new_robot_pos = robot_pos
+                new_goal_pos = goal_pos
                 valid_placement = True
 
             if not valid_placement:
                 print(
-                    f"Warning: Failed to find valid initial placement for env {env_idx} after {max_placement_attempts} attempts."
+                    f"Warning: Failed partial reset for world {world_e} agent {agent_a} "
+                    f"after {max_placement_attempts} attempts."
                 )
 
-            robot_pos_np[env_idx] = robot_pos
-            goal_pos_np[env_idx] = goal_pos
-            if self.num_obstacles > 0:
-                obstacle_positions_np[env_idx] = obs_pos
+            robot_pos_np[world_e, agent_a] = new_robot_pos
+            goal_pos_np[world_e, agent_a] = new_goal_pos
 
-        # Update only the reset indices in the tensors
+        # Write back updated positions
         device = self.device
-        self._robot_pos[reset_indices] = torch.from_numpy(
-            robot_pos_np[reset_indices]
-        ).to(device)
-        self._goal_pos[reset_indices] = torch.from_numpy(goal_pos_np[reset_indices]).to(
-            device
-        )
-        self._obstacle_positions[reset_indices] = torch.from_numpy(
-            obstacle_positions_np[reset_indices]
-        ).to(device)
-        self._last_velocity[reset_indices] = 0
-        self._elapsed_steps[reset_indices] = 0
-        self.episode_length_buf[reset_indices] = 0
+        self._robot_pos = torch.from_numpy(robot_pos_np).to(device)
+        self._goal_pos = torch.from_numpy(goal_pos_np).to(device)
+        # Obstacles are NOT re-randomized on per-agent reset (shared by world)
+
+        world_indices = reset_indices_np // A
+        agent_indices = reset_indices_np % A
+        self._robot_vel[world_indices, agent_indices] = 0
+        self._elapsed_steps[reset_indices_np] = 0
+        self.episode_length_buf[reset_indices_np] = 0
 
     def close(self):
         """Cleans up resources, like the rendering window."""

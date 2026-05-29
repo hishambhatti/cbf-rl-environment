@@ -1,0 +1,6 @@
+{
+  "obs_layout": "legacy",
+  "dynamics_model": "quasi_static",
+  "num_agents": 1,
+  "_provenance": "Original single-agent replication (performance-test baseline)"
+}

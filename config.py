@@ -8,7 +8,7 @@ import numpy as np # Added for observation size calculation
 ENV_ID = 'NaiveNavigation-v0' # Use the registered environment ID
 NUM_OBSTACLES = 3
 WORLD_SIZE = 10.0
-NUM_AGENTS = 2
+NUM_AGENTS = 1
 # goal_pos(2) + obstacles(3, closest only) + robot_pos(2) + robot_vel(2)
 # + other_agents((NUM_AGENTS-1)*3)
 FLATTENED_OBS_SIZE = 2 + 3 + 2 + 2 + (NUM_AGENTS - 1) * 3

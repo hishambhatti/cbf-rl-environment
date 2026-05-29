@@ -360,16 +360,36 @@ def test():
     mean_reward = np.mean(total_rewards) if total_rewards else 0.0
     std_reward = np.std(total_rewards) if total_rewards else 0.0
     success_rate = (total_successes / num_episodes) if num_episodes > 0 else 0.0
-    print("\n--- Evaluation Summary ---")
-    print(f"Episodes: {num_episodes}")
-    print(f"Mean Reward: {mean_reward:.2f} +/- {std_reward:.2f}")
-    print(f"Success Rate: {success_rate:.2%}")
     fail_total = num_episodes - total_successes
-    print(f"Failures: {fail_total} ({(fail_total / num_episodes):.2%})")
-    print(f" - Obstacle: {failure_counts['obstacle']} ({(failure_counts['obstacle'] / num_episodes):.2%})")
-    print(f" - Wall: {failure_counts['wall']} ({(failure_counts['wall'] / num_episodes):.2%})")
-    print(f" - Timeout: {failure_counts['timeout']} ({(failure_counts['timeout'] / num_episodes):.2%})")
-    print("--------------------------")
+    from datetime import datetime
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"results_{args.env}_{timestamp}"
+    summary_lines = [
+        f"=== Evaluation Summary: {args.env.upper()} ===",
+        f"Timestamp:      {timestamp}",
+        f"Dynamics:       {args.dynamics_model}",
+        f"CBF Filter:     {args.use_cbf_action_filtering}",
+        f"CBF Penalty:    {args.use_cbf_reward_penalty}",
+        f"Agents:         {cfg['env']['num_agents']}",
+        f"Obstacles:      {cfg['env']['num_obstacles']}",
+        f"Episodes:       {num_episodes}",
+        f"Mean Reward:    {mean_reward:.2f} +/- {std_reward:.2f}",
+        f"Success Rate:   {success_rate:.2%}",
+        f"Failures:       {fail_total} ({(fail_total / num_episodes):.2%})",
+        f" - Obstacle:    {failure_counts['obstacle']} ({(failure_counts['obstacle'] / num_episodes):.2%})",
+        f" - Wall:        {failure_counts['wall']} ({(failure_counts['wall'] / num_episodes):.2%})",
+        f" - Timeout:     {failure_counts['timeout']} ({(failure_counts['timeout'] / num_episodes):.2%})",
+        "=" * 40,
+    ]
+
+    print("\n" + "\n".join(summary_lines))
+
+    result_dir = os.path.join("results", f"results_{args.env}", run_name)
+    os.makedirs(result_dir, exist_ok=True)
+    result_path = os.path.join(result_dir, f"{run_name}.txt")
+    with open(result_path, "w") as f:
+        f.write("\n".join(summary_lines) + "\n")
+    print(f"Results saved to {result_path}")
 
 
 if __name__ == '__main__':

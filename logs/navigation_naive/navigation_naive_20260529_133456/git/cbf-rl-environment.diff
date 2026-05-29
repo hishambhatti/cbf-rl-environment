@@ -1,0 +1,12 @@
+--- git status ---
+On branch jang-integration
+Your branch is up to date with 'origin/jang-integration'.
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/navigation_naive/navigation_naive_20260529_133456/
+
+nothing added to commit but untracked files present (use "git add" to track) 
+
+
+--- git diff ---

@@ -37,6 +37,26 @@ def parse_args():
                         help="Number of agents per world (default: config NUM_AGENTS=1)")
     return parser.parse_args()
 
+def find_run_dir_with_checkpoints(base_log_dir, run_name):
+    """Return the directory that contains model checkpoints for this run."""
+    candidates = [base_log_dir]
+    nested = os.path.join(base_log_dir, run_name)
+    if nested != base_log_dir:
+        candidates.append(nested)
+    for path in candidates:
+        if os.path.isdir(path) and any(
+            f.startswith("model_") and f.endswith(".pt") for f in os.listdir(path)
+        ):
+            return path
+    return base_log_dir
+
+def write_env_meta(run_dir, meta):
+    os.makedirs(run_dir, exist_ok=True)
+    path = os.path.join(run_dir, "env_meta.json")
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"--> Wrote env metadata to {path}")
+
 def train():
     """Initializes and runs the rsl-rl training process."""
     if not _RSL_RL_AVAILABLE:
@@ -103,8 +123,7 @@ def train():
         print("\nOnPolicyRunner initialized successfully.")
         print("--> Check TensorBoard for rollout and reward statistics.\n")
 
-        run_dir = os.path.join(base_log_dir, cfg['runner']['run_name'])
-        os.makedirs(run_dir, exist_ok=True)
+        run_dir = find_run_dir_with_checkpoints(base_log_dir, cfg['runner']['run_name'])
         meta = {
             "env": args.env,
             "obs_layout": args.obs_layout,
@@ -114,9 +133,7 @@ def train():
             "use_cbf_reward_penalty": bool(args.use_cbf_reward_penalty),
         }
         try:
-            with open(os.path.join(run_dir, "env_meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
-            print(f"--> Wrote env metadata to {os.path.join(run_dir, 'env_meta.json')}")
+            write_env_meta(run_dir, meta)
         except Exception as e:
             print(f"Warning: failed to write env_meta.json: {e}")
 

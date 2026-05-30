@@ -68,6 +68,16 @@ def find_latest_run_dir(base_log_dir, env_type):
         print(f"Error finding latest run directory in {base_log_dir} for env {env_type}: {e}")
         return None
 
+def find_env_meta_path(run_dir):
+    """Locate env_meta.json next to checkpoints (handles legacy double-nested runs)."""
+    direct = os.path.join(run_dir, "env_meta.json")
+    if os.path.isfile(direct):
+        return direct
+    nested = os.path.join(run_dir, os.path.basename(run_dir), "env_meta.json")
+    if os.path.isfile(nested):
+        return nested
+    return direct
+
 def test():
     if not _RSL_RL_AVAILABLE:
         return
@@ -108,7 +118,7 @@ def test():
          print(f"Error: Log directory not found: {trained_model_log_dir}")
          return
 
-    meta_path = os.path.join(trained_model_log_dir, "env_meta.json")
+    meta_path = find_env_meta_path(trained_model_log_dir)
     meta = {}
     if os.path.isfile(meta_path):
         try:

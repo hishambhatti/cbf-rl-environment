@@ -1233,54 +1233,85 @@ class UnifiedNavigationEnv(VecEnv):
         else:
             return None  # Should not happen if render_mode is validated
     
-    def _reset_envs(self, reset_indices: torch.Tensor):
-        """
-        Resets only the (virtual) environments specified by reset_indices.
+    def _reset_world_layout(
+        self,
+        world_e: int,
+        robot_pos_np: np.ndarray,
+        goal_pos_np: np.ndarray,
+        obstacle_positions_np: np.ndarray,
+        obstacle_radii_np: np.ndarray,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Sample a fresh obstacle + agent layout for one parallel world.
 
-        reset_indices are in flat space [0, P*A). For multi-agent envs,
-        vi = world_e * A + agent_a, so we re-place only the specific agent
-        while keeping other agents and shared obstacles unchanged.
+        Matches the initial ``reset()`` placement logic. Used for episode-end
+        resets so single-agent training behaves like performance-test (full
+        world re-randomization) and multi-agent worlds reset all agents together
+        with new shared obstacles.
         """
-        if not isinstance(reset_indices, torch.Tensor):
-            reset_indices = torch.tensor(reset_indices, dtype=torch.long)
-        reset_indices_np = reset_indices.cpu().numpy()
-
         A = self.num_agents
-        robot_pos_np = self._robot_pos.cpu().numpy()      # (P, A, 2)
-        goal_pos_np = self._goal_pos.cpu().numpy()         # (P, A, 2)
-        obstacle_positions_np = self._obstacle_positions.cpu().numpy()  # (P, O, 2)
-        obstacle_radii_np = self._obstacle_radii.cpu().numpy()          # (P, O)
+        placement_attempts = 0
+        max_placement_attempts = 100
+        valid_placement = False
+        min_obstacle_separation_buffer = 0.5
+        min_robot_goal_distance = self.world_size / 3.0
+        current_env_obstacle_radii = obstacle_radii_np[world_e]
+        current_env_max_obstacle_radius = (
+            np.max(current_env_obstacle_radii) if self.num_obstacles > 0 else 0.0
+        )
+        agent_robots: List[np.ndarray] = []
+        agent_goals: List[np.ndarray] = []
+        obs_pos = np.empty((0, 2), dtype=np.float32)
 
-        for vi in reset_indices_np:
-            world_e = int(vi) // A
-            agent_a = int(vi) % A
+        while not valid_placement and placement_attempts < max_placement_attempts:
+            placement_attempts += 1
+            agent_robots = []
+            agent_goals = []
 
-            obs_pos = obstacle_positions_np[world_e]
-            current_env_obstacle_radii = obstacle_radii_np[world_e]
-            # Positions of sibling agents (keep them as obstacles for clearance check)
-            sibling_positions = np.concatenate(
-                [robot_pos_np[world_e, :agent_a, :],
-                 robot_pos_np[world_e, agent_a + 1:, :]], axis=0
-            )  # (A-1, 2)
-
-            placement_attempts = 0
-            max_placement_attempts = 100
-            valid_placement = False
-            min_robot_goal_distance = self.world_size / 3.0
-            goal_wall_buffer = max(self.goal_radius, self.robot_radius)
-            robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
-            wall_buffer = self.robot_radius + 1.0
-
-            new_robot_pos = robot_pos_np[world_e, agent_a].copy()
-            new_goal_pos = goal_pos_np[world_e, agent_a].copy()
-
-            while not valid_placement and placement_attempts < max_placement_attempts:
-                placement_attempts += 1
-
-                # Place goal
-                goal_pos = np.random.uniform(
-                    goal_wall_buffer, self.world_size - goal_wall_buffer, size=(2,)
+            if options and options.get("obstacle_pos") is not None:
+                obs_pos = np.array(options["obstacle_pos"], dtype=np.float32)
+            elif self.num_obstacles > 0:
+                obs_pos = self.np_random.uniform(
+                    current_env_max_obstacle_radius,
+                    self.world_size - current_env_max_obstacle_radius,
+                    size=(self.num_obstacles, 2),
                 ).astype(np.float32)
+            else:
+                obs_pos = np.empty((0, 2), dtype=np.float32)
+
+            obstacles_clear = True
+            if self.num_obstacles > 1:
+                for i in range(self.num_obstacles):
+                    for j in range(i + 1, self.num_obstacles):
+                        dist_sq = np.sum((obs_pos[i] - obs_pos[j]) ** 2)
+                        min_dist_sq = (
+                            current_env_obstacle_radii[i]
+                            + current_env_obstacle_radii[j]
+                            + min_obstacle_separation_buffer
+                        ) ** 2
+                        if dist_sq < min_dist_sq:
+                            obstacles_clear = False
+                            break
+                    if not obstacles_clear:
+                        break
+            if not obstacles_clear:
+                continue
+
+            all_agents_placed = True
+            for agent_idx in range(A):
+                goal_wall_buffer = max(self.goal_radius, self.robot_radius)
+                robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+                wall_buffer = self.robot_radius + 1.0
+
+                if options and options.get("goal_pos") is not None:
+                    goal_pos = np.array(options["goal_pos"], dtype=np.float32)
+                else:
+                    goal_pos = self.np_random.uniform(
+                        goal_wall_buffer,
+                        self.world_size - goal_wall_buffer,
+                        size=(2,),
+                    ).astype(np.float32)
+
                 goal_hsafe = True
                 if (
                     (goal_pos[0] < self.robot_radius)
@@ -1304,12 +1335,17 @@ class UnifiedNavigationEnv(VecEnv):
                             goal_hsafe = False
                             break
                 if not goal_hsafe:
-                    continue
+                    all_agents_placed = False
+                    break
 
-                # Place robot
-                robot_pos = np.random.uniform(
-                    robot_wall_buffer, self.world_size - robot_wall_buffer, size=(2,)
-                ).astype(np.float32)
+                if options and options.get("robot_pos") is not None:
+                    robot_pos = np.array(options["robot_pos"], dtype=np.float32)
+                else:
+                    robot_pos = self.np_random.uniform(
+                        robot_wall_buffer,
+                        self.world_size - robot_wall_buffer,
+                        size=(2,),
+                    ).astype(np.float32)
 
                 if (
                     (robot_pos[0] <= wall_buffer)
@@ -1317,7 +1353,8 @@ class UnifiedNavigationEnv(VecEnv):
                     or (robot_pos[1] <= wall_buffer)
                     or (robot_pos[1] >= self.world_size - wall_buffer)
                 ):
-                    continue
+                    all_agents_placed = False
+                    break
 
                 robot_clear = True
                 for i, o_pos in enumerate(obs_pos):
@@ -1328,61 +1365,116 @@ class UnifiedNavigationEnv(VecEnv):
                         robot_clear = False
                         break
                 if not robot_clear:
-                    continue
+                    all_agents_placed = False
+                    break
 
-                # Clearance from sibling agents
-                for sib in sibling_positions:
-                    if np.linalg.norm(robot_pos - sib) <= 2 * self.robot_radius + 1.0:
+                for prev_robot in agent_robots:
+                    if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 1.0:
                         robot_clear = False
                         break
                 if not robot_clear:
-                    continue
+                    all_agents_placed = False
+                    break
 
                 if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
-                    continue
+                    all_agents_placed = False
+                    break
 
-                # Obstacle blocks path check
-                if self.num_obstacles > 0:
-                    dist_rg = np.linalg.norm(robot_pos - goal_pos)
-                    blocks = False
+                if agent_idx == 0 and self.num_obstacles > 0:
+                    dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
+                    obstacle_blocks_path = False
                     for i, o_pos in enumerate(obs_pos):
                         if (
                             abs(
                                 np.linalg.norm(robot_pos - o_pos)
                                 + np.linalg.norm(goal_pos - o_pos)
-                                - dist_rg
+                                - dist_robot_goal
                             )
                             < current_env_obstacle_radii[i] * 2
                         ):
-                            blocks = True
+                            obstacle_blocks_path = True
                             break
-                    if not blocks:
-                        continue
+                    if not obstacle_blocks_path:
+                        all_agents_placed = False
+                        break
 
-                new_robot_pos = robot_pos
-                new_goal_pos = goal_pos
+                agent_robots.append(robot_pos)
+                agent_goals.append(goal_pos)
+
+            if all_agents_placed:
                 valid_placement = True
 
-            if not valid_placement:
-                print(
-                    f"Warning: Failed partial reset for world {world_e} agent {agent_a} "
-                    f"after {max_placement_attempts} attempts."
+        if not valid_placement:
+            return False
+
+        if len(agent_robots) < A:
+            for k in range(len(agent_robots), A):
+                agent_robots.append(
+                    np.array(
+                        [self.world_size * 0.2, self.world_size * (0.2 + k * 0.1)],
+                        dtype=np.float32,
+                    )
+                )
+                agent_goals.append(
+                    np.array(
+                        [self.world_size * 0.8, self.world_size * (0.8 - k * 0.1)],
+                        dtype=np.float32,
+                    )
                 )
 
-            robot_pos_np[world_e, agent_a] = new_robot_pos
-            goal_pos_np[world_e, agent_a] = new_goal_pos
+        robot_pos_np[world_e] = np.array(agent_robots, dtype=np.float32)
+        goal_pos_np[world_e] = np.array(agent_goals, dtype=np.float32)
+        if self.num_obstacles > 0:
+            obstacle_positions_np[world_e] = obs_pos
+        return True
 
-        # Write back updated positions
+    def _reset_envs(self, reset_indices: torch.Tensor):
+        """
+        Resets parallel worlds whose episodes ended.
+
+        reset_indices are virtual env ids in [0, P*A). Worlds are deduplicated so
+        each finished episode triggers one full-world layout refresh (obstacles +
+        all agents), matching performance-test for num_agents=1 and giving
+        comparable multi-agent training resets.
+        """
+        if not isinstance(reset_indices, torch.Tensor):
+            reset_indices = torch.tensor(reset_indices, dtype=torch.long)
+        reset_indices_np = reset_indices.cpu().numpy()
+
+        A = self.num_agents
+        world_indices = np.unique(reset_indices_np // A)
+
+        robot_pos_np = self._robot_pos.cpu().numpy()
+        goal_pos_np = self._goal_pos.cpu().numpy()
+        obstacle_positions_np = self._obstacle_positions.cpu().numpy()
+        obstacle_radii_np = self._obstacle_radii.cpu().numpy()
+
+        for world_e in world_indices:
+            world_e = int(world_e)
+            if not self._reset_world_layout(
+                world_e,
+                robot_pos_np,
+                goal_pos_np,
+                obstacle_positions_np,
+                obstacle_radii_np,
+            ):
+                print(
+                    f"Warning: Failed to reset world {world_e} after 100 attempts."
+                )
+
         device = self.device
         self._robot_pos = torch.from_numpy(robot_pos_np).to(device)
         self._goal_pos = torch.from_numpy(goal_pos_np).to(device)
-        # Obstacles are NOT re-randomized on per-agent reset (shared by world)
+        self._obstacle_positions = torch.from_numpy(obstacle_positions_np).to(device)
 
-        world_indices = reset_indices_np // A
-        agent_indices = reset_indices_np % A
-        self._robot_vel[world_indices, agent_indices] = 0
-        self._elapsed_steps[reset_indices_np] = 0
-        self.episode_length_buf[reset_indices_np] = 0
+        self._robot_vel[world_indices] = 0
+        self._world_agents_done_buf[world_indices] = False
+        self._agents_reached_goal_buf[world_indices] = False
+        flat_indices = np.concatenate(
+            [np.arange(w * A, (w + 1) * A, dtype=np.int64) for w in world_indices]
+        )
+        self._elapsed_steps[flat_indices] = 0
+        self.episode_length_buf[flat_indices] = 0
 
     def close(self):
         """Cleans up resources, like the rendering window."""

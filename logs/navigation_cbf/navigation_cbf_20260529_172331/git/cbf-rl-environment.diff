@@ -1,0 +1,448 @@
+--- git status ---
+On branch jang-integration
+Your branch is up to date with 'origin/jang-integration'.
+
+Changes not staged for commit:
+  (use "git add/rm <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	deleted:    logs/navigation_cbf/navigation_cbf_20260529_145538/navigation_cbf_20260529_145538/env_meta.json
+	deleted:    logs/navigation_naive/navigation_naive_20260529_133456/navigation_naive_20260529_133456/env_meta.json
+	modified:   nav_env/unified_navigation_env.py
+	modified:   test.py
+	modified:   train.py
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	logs/navigation_cbf/navigation_cbf_20260529_145538/env_meta.json
+	logs/navigation_cbf/navigation_cbf_20260529_172331/
+	logs/navigation_naive/navigation_naive_20260529_133456/env_meta.json
+	logs/navigation_naive/navigation_naive_20260529_161714/
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/logs/navigation_cbf/navigation_cbf_20260529_145538/navigation_cbf_20260529_145538/env_meta.json b/logs/navigation_cbf/navigation_cbf_20260529_145538/navigation_cbf_20260529_145538/env_meta.json
+deleted file mode 100644
+index e0a9b53..0000000
+--- a/logs/navigation_cbf/navigation_cbf_20260529_145538/navigation_cbf_20260529_145538/env_meta.json
++++ /dev/null
+@@ -1,8 +0,0 @@
+-{
+-  "env": "cbf",
+-  "obs_layout": "legacy",
+-  "dynamics_model": "quasi_static",
+-  "num_agents": 1,
+-  "use_cbf_action_filtering": true,
+-  "use_cbf_reward_penalty": true
+-}
+\ No newline at end of file
+diff --git a/logs/navigation_naive/navigation_naive_20260529_133456/navigation_naive_20260529_133456/env_meta.json b/logs/navigation_naive/navigation_naive_20260529_133456/navigation_naive_20260529_133456/env_meta.json
+deleted file mode 100644
+index 0e15db9..0000000
+--- a/logs/navigation_naive/navigation_naive_20260529_133456/navigation_naive_20260529_133456/env_meta.json
++++ /dev/null
+@@ -1,8 +0,0 @@
+-{
+-  "env": "naive",
+-  "obs_layout": "legacy",
+-  "dynamics_model": "quasi_static",
+-  "num_agents": 1,
+-  "use_cbf_action_filtering": false,
+-  "use_cbf_reward_penalty": false
+-}
+\ No newline at end of file
+diff --git a/nav_env/unified_navigation_env.py b/nav_env/unified_navigation_env.py
+index 91c5d03..08ee5bc 100644
+--- a/nav_env/unified_navigation_env.py
++++ b/nav_env/unified_navigation_env.py
+@@ -1233,54 +1233,85 @@ class UnifiedNavigationEnv(VecEnv):
+         else:
+             return None  # Should not happen if render_mode is validated
+     
+-    def _reset_envs(self, reset_indices: torch.Tensor):
+-        """
+-        Resets only the (virtual) environments specified by reset_indices.
+-
+-        reset_indices are in flat space [0, P*A). For multi-agent envs,
+-        vi = world_e * A + agent_a, so we re-place only the specific agent
+-        while keeping other agents and shared obstacles unchanged.
++    def _reset_world_layout(
++        self,
++        world_e: int,
++        robot_pos_np: np.ndarray,
++        goal_pos_np: np.ndarray,
++        obstacle_positions_np: np.ndarray,
++        obstacle_radii_np: np.ndarray,
++        options: Optional[Dict[str, Any]] = None,
++    ) -> bool:
++        """Sample a fresh obstacle + agent layout for one parallel world.
++
++        Matches the initial ``reset()`` placement logic. Used for episode-end
++        resets so single-agent training behaves like performance-test (full
++        world re-randomization) and multi-agent worlds reset all agents together
++        with new shared obstacles.
+         """
+-        if not isinstance(reset_indices, torch.Tensor):
+-            reset_indices = torch.tensor(reset_indices, dtype=torch.long)
+-        reset_indices_np = reset_indices.cpu().numpy()
+-
+         A = self.num_agents
+-        robot_pos_np = self._robot_pos.cpu().numpy()      # (P, A, 2)
+-        goal_pos_np = self._goal_pos.cpu().numpy()         # (P, A, 2)
+-        obstacle_positions_np = self._obstacle_positions.cpu().numpy()  # (P, O, 2)
+-        obstacle_radii_np = self._obstacle_radii.cpu().numpy()          # (P, O)
+-
+-        for vi in reset_indices_np:
+-            world_e = int(vi) // A
+-            agent_a = int(vi) % A
+-
+-            obs_pos = obstacle_positions_np[world_e]
+-            current_env_obstacle_radii = obstacle_radii_np[world_e]
+-            # Positions of sibling agents (keep them as obstacles for clearance check)
+-            sibling_positions = np.concatenate(
+-                [robot_pos_np[world_e, :agent_a, :],
+-                 robot_pos_np[world_e, agent_a + 1:, :]], axis=0
+-            )  # (A-1, 2)
+-
+-            placement_attempts = 0
+-            max_placement_attempts = 100
+-            valid_placement = False
+-            min_robot_goal_distance = self.world_size / 3.0
+-            goal_wall_buffer = max(self.goal_radius, self.robot_radius)
+-            robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+-            wall_buffer = self.robot_radius + 1.0
++        placement_attempts = 0
++        max_placement_attempts = 100
++        valid_placement = False
++        min_obstacle_separation_buffer = 0.5
++        min_robot_goal_distance = self.world_size / 3.0
++        current_env_obstacle_radii = obstacle_radii_np[world_e]
++        current_env_max_obstacle_radius = (
++            np.max(current_env_obstacle_radii) if self.num_obstacles > 0 else 0.0
++        )
++        agent_robots: List[np.ndarray] = []
++        agent_goals: List[np.ndarray] = []
++        obs_pos = np.empty((0, 2), dtype=np.float32)
++
++        while not valid_placement and placement_attempts < max_placement_attempts:
++            placement_attempts += 1
++            agent_robots = []
++            agent_goals = []
++
++            if options and options.get("obstacle_pos") is not None:
++                obs_pos = np.array(options["obstacle_pos"], dtype=np.float32)
++            elif self.num_obstacles > 0:
++                obs_pos = self.np_random.uniform(
++                    current_env_max_obstacle_radius,
++                    self.world_size - current_env_max_obstacle_radius,
++                    size=(self.num_obstacles, 2),
++                ).astype(np.float32)
++            else:
++                obs_pos = np.empty((0, 2), dtype=np.float32)
++
++            obstacles_clear = True
++            if self.num_obstacles > 1:
++                for i in range(self.num_obstacles):
++                    for j in range(i + 1, self.num_obstacles):
++                        dist_sq = np.sum((obs_pos[i] - obs_pos[j]) ** 2)
++                        min_dist_sq = (
++                            current_env_obstacle_radii[i]
++                            + current_env_obstacle_radii[j]
++                            + min_obstacle_separation_buffer
++                        ) ** 2
++                        if dist_sq < min_dist_sq:
++                            obstacles_clear = False
++                            break
++                    if not obstacles_clear:
++                        break
++            if not obstacles_clear:
++                continue
+ 
+-            new_robot_pos = robot_pos_np[world_e, agent_a].copy()
+-            new_goal_pos = goal_pos_np[world_e, agent_a].copy()
++            all_agents_placed = True
++            for agent_idx in range(A):
++                goal_wall_buffer = max(self.goal_radius, self.robot_radius)
++                robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
++                wall_buffer = self.robot_radius + 1.0
+ 
+-            while not valid_placement and placement_attempts < max_placement_attempts:
+-                placement_attempts += 1
++                if options and options.get("goal_pos") is not None:
++                    goal_pos = np.array(options["goal_pos"], dtype=np.float32)
++                else:
++                    goal_pos = self.np_random.uniform(
++                        goal_wall_buffer,
++                        self.world_size - goal_wall_buffer,
++                        size=(2,),
++                    ).astype(np.float32)
+ 
+-                # Place goal
+-                goal_pos = np.random.uniform(
+-                    goal_wall_buffer, self.world_size - goal_wall_buffer, size=(2,)
+-                ).astype(np.float32)
+                 goal_hsafe = True
+                 if (
+                     (goal_pos[0] < self.robot_radius)
+@@ -1304,12 +1335,17 @@ class UnifiedNavigationEnv(VecEnv):
+                             goal_hsafe = False
+                             break
+                 if not goal_hsafe:
+-                    continue
++                    all_agents_placed = False
++                    break
+ 
+-                # Place robot
+-                robot_pos = np.random.uniform(
+-                    robot_wall_buffer, self.world_size - robot_wall_buffer, size=(2,)
+-                ).astype(np.float32)
++                if options and options.get("robot_pos") is not None:
++                    robot_pos = np.array(options["robot_pos"], dtype=np.float32)
++                else:
++                    robot_pos = self.np_random.uniform(
++                        robot_wall_buffer,
++                        self.world_size - robot_wall_buffer,
++                        size=(2,),
++                    ).astype(np.float32)
+ 
+                 if (
+                     (robot_pos[0] <= wall_buffer)
+@@ -1317,7 +1353,8 @@ class UnifiedNavigationEnv(VecEnv):
+                     or (robot_pos[1] <= wall_buffer)
+                     or (robot_pos[1] >= self.world_size - wall_buffer)
+                 ):
+-                    continue
++                    all_agents_placed = False
++                    break
+ 
+                 robot_clear = True
+                 for i, o_pos in enumerate(obs_pos):
+@@ -1328,61 +1365,116 @@ class UnifiedNavigationEnv(VecEnv):
+                         robot_clear = False
+                         break
+                 if not robot_clear:
+-                    continue
++                    all_agents_placed = False
++                    break
+ 
+-                # Clearance from sibling agents
+-                for sib in sibling_positions:
+-                    if np.linalg.norm(robot_pos - sib) <= 2 * self.robot_radius + 1.0:
++                for prev_robot in agent_robots:
++                    if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 1.0:
+                         robot_clear = False
+                         break
+                 if not robot_clear:
+-                    continue
++                    all_agents_placed = False
++                    break
+ 
+                 if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
+-                    continue
++                    all_agents_placed = False
++                    break
+ 
+-                # Obstacle blocks path check
+-                if self.num_obstacles > 0:
+-                    dist_rg = np.linalg.norm(robot_pos - goal_pos)
+-                    blocks = False
++                if agent_idx == 0 and self.num_obstacles > 0:
++                    dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
++                    obstacle_blocks_path = False
+                     for i, o_pos in enumerate(obs_pos):
+                         if (
+                             abs(
+                                 np.linalg.norm(robot_pos - o_pos)
+                                 + np.linalg.norm(goal_pos - o_pos)
+-                                - dist_rg
++                                - dist_robot_goal
+                             )
+                             < current_env_obstacle_radii[i] * 2
+                         ):
+-                            blocks = True
++                            obstacle_blocks_path = True
+                             break
+-                    if not blocks:
+-                        continue
++                    if not obstacle_blocks_path:
++                        all_agents_placed = False
++                        break
++
++                agent_robots.append(robot_pos)
++                agent_goals.append(goal_pos)
+ 
+-                new_robot_pos = robot_pos
+-                new_goal_pos = goal_pos
++            if all_agents_placed:
+                 valid_placement = True
+ 
+-            if not valid_placement:
+-                print(
+-                    f"Warning: Failed partial reset for world {world_e} agent {agent_a} "
+-                    f"after {max_placement_attempts} attempts."
++        if not valid_placement:
++            return False
++
++        if len(agent_robots) < A:
++            for k in range(len(agent_robots), A):
++                agent_robots.append(
++                    np.array(
++                        [self.world_size * 0.2, self.world_size * (0.2 + k * 0.1)],
++                        dtype=np.float32,
++                    )
+                 )
++                agent_goals.append(
++                    np.array(
++                        [self.world_size * 0.8, self.world_size * (0.8 - k * 0.1)],
++                        dtype=np.float32,
++                    )
++                )
++
++        robot_pos_np[world_e] = np.array(agent_robots, dtype=np.float32)
++        goal_pos_np[world_e] = np.array(agent_goals, dtype=np.float32)
++        if self.num_obstacles > 0:
++            obstacle_positions_np[world_e] = obs_pos
++        return True
+ 
+-            robot_pos_np[world_e, agent_a] = new_robot_pos
+-            goal_pos_np[world_e, agent_a] = new_goal_pos
++    def _reset_envs(self, reset_indices: torch.Tensor):
++        """
++        Resets parallel worlds whose episodes ended.
++
++        reset_indices are virtual env ids in [0, P*A). Worlds are deduplicated so
++        each finished episode triggers one full-world layout refresh (obstacles +
++        all agents), matching performance-test for num_agents=1 and giving
++        comparable multi-agent training resets.
++        """
++        if not isinstance(reset_indices, torch.Tensor):
++            reset_indices = torch.tensor(reset_indices, dtype=torch.long)
++        reset_indices_np = reset_indices.cpu().numpy()
++
++        A = self.num_agents
++        world_indices = np.unique(reset_indices_np // A)
++
++        robot_pos_np = self._robot_pos.cpu().numpy()
++        goal_pos_np = self._goal_pos.cpu().numpy()
++        obstacle_positions_np = self._obstacle_positions.cpu().numpy()
++        obstacle_radii_np = self._obstacle_radii.cpu().numpy()
++
++        for world_e in world_indices:
++            world_e = int(world_e)
++            if not self._reset_world_layout(
++                world_e,
++                robot_pos_np,
++                goal_pos_np,
++                obstacle_positions_np,
++                obstacle_radii_np,
++            ):
++                print(
++                    f"Warning: Failed to reset world {world_e} after 100 attempts."
++                )
+ 
+-        # Write back updated positions
+         device = self.device
+         self._robot_pos = torch.from_numpy(robot_pos_np).to(device)
+         self._goal_pos = torch.from_numpy(goal_pos_np).to(device)
+-        # Obstacles are NOT re-randomized on per-agent reset (shared by world)
++        self._obstacle_positions = torch.from_numpy(obstacle_positions_np).to(device)
+ 
+-        world_indices = reset_indices_np // A
+-        agent_indices = reset_indices_np % A
+-        self._robot_vel[world_indices, agent_indices] = 0
+-        self._elapsed_steps[reset_indices_np] = 0
+-        self.episode_length_buf[reset_indices_np] = 0
++        self._robot_vel[world_indices] = 0
++        self._world_agents_done_buf[world_indices] = False
++        self._agents_reached_goal_buf[world_indices] = False
++        flat_indices = np.concatenate(
++            [np.arange(w * A, (w + 1) * A, dtype=np.int64) for w in world_indices]
++        )
++        self._elapsed_steps[flat_indices] = 0
++        self.episode_length_buf[flat_indices] = 0
+ 
+     def close(self):
+         """Cleans up resources, like the rendering window."""
+diff --git a/test.py b/test.py
+index a3205bb..325833c 100644
+--- a/test.py
++++ b/test.py
+@@ -68,6 +68,16 @@ def find_latest_run_dir(base_log_dir, env_type):
+         print(f"Error finding latest run directory in {base_log_dir} for env {env_type}: {e}")
+         return None
+ 
++def find_env_meta_path(run_dir):
++    """Locate env_meta.json next to checkpoints (handles legacy double-nested runs)."""
++    direct = os.path.join(run_dir, "env_meta.json")
++    if os.path.isfile(direct):
++        return direct
++    nested = os.path.join(run_dir, os.path.basename(run_dir), "env_meta.json")
++    if os.path.isfile(nested):
++        return nested
++    return direct
++
+ def test():
+     if not _RSL_RL_AVAILABLE:
+         return
+@@ -108,7 +118,7 @@ def test():
+          print(f"Error: Log directory not found: {trained_model_log_dir}")
+          return
+ 
+-    meta_path = os.path.join(trained_model_log_dir, "env_meta.json")
++    meta_path = find_env_meta_path(trained_model_log_dir)
+     meta = {}
+     if os.path.isfile(meta_path):
+         try:
+diff --git a/train.py b/train.py
+index 2fbfdf6..c4b1a13 100755
+--- a/train.py
++++ b/train.py
+@@ -37,6 +37,26 @@ def parse_args():
+                         help="Number of agents per world (default: config NUM_AGENTS=1)")
+     return parser.parse_args()
+ 
++def find_run_dir_with_checkpoints(base_log_dir, run_name):
++    """Return the directory that contains model checkpoints for this run."""
++    candidates = [base_log_dir]
++    nested = os.path.join(base_log_dir, run_name)
++    if nested != base_log_dir:
++        candidates.append(nested)
++    for path in candidates:
++        if os.path.isdir(path) and any(
++            f.startswith("model_") and f.endswith(".pt") for f in os.listdir(path)
++        ):
++            return path
++    return base_log_dir
++
++def write_env_meta(run_dir, meta):
++    os.makedirs(run_dir, exist_ok=True)
++    path = os.path.join(run_dir, "env_meta.json")
++    with open(path, "w") as f:
++        json.dump(meta, f, indent=2)
++    print(f"--> Wrote env metadata to {path}")
++
+ def train():
+     """Initializes and runs the rsl-rl training process."""
+     if not _RSL_RL_AVAILABLE:
+@@ -103,8 +123,7 @@ def train():
+         print("\nOnPolicyRunner initialized successfully.")
+         print("--> Check TensorBoard for rollout and reward statistics.\n")
+ 
+-        run_dir = os.path.join(base_log_dir, cfg['runner']['run_name'])
+-        os.makedirs(run_dir, exist_ok=True)
++        run_dir = find_run_dir_with_checkpoints(base_log_dir, cfg['runner']['run_name'])
+         meta = {
+             "env": args.env,
+             "obs_layout": args.obs_layout,
+@@ -114,9 +133,7 @@ def train():
+             "use_cbf_reward_penalty": bool(args.use_cbf_reward_penalty),
+         }
+         try:
+-            with open(os.path.join(run_dir, "env_meta.json"), "w") as f:
+-                json.dump(meta, f, indent=2)
+-            print(f"--> Wrote env metadata to {os.path.join(run_dir, 'env_meta.json')}")
++            write_env_meta(run_dir, meta)
+         except Exception as e:
+             print(f"Warning: failed to write env_meta.json: {e}")
+ 

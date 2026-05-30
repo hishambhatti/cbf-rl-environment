@@ -1,0 +1,8 @@
+{
+  "env": "cbf",
+  "obs_layout": "legacy",
+  "dynamics_model": "quasi_static",
+  "num_agents": 1,
+  "use_cbf_action_filtering": true,
+  "use_cbf_reward_penalty": true
+}

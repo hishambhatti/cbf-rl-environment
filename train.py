@@ -25,16 +25,37 @@ def parse_args():
     parser.add_argument("--use_cbf_reward_penalty", action="store_true", help="Use CBF reward penalty")
     parser.add_argument("--headless", action="store_true",
                         help="Run in headless mode (no GUI).")
-    parser.add_argument('--dynamics_model', type=str, default='dynamic',
+    parser.add_argument('--dynamics_model', type=str, default='quasi_static',
                         choices=['dynamic', 'quasi_static'],
-                        help="Dynamics model: 'dynamic' (double-integrator) or 'quasi_static' (single-integrator)")
-    parser.add_argument('--obs_layout', type=str, default='current',
+                        help=("Dynamics model: 'quasi_static' (single-integrator, original "
+                              "replication default) or 'dynamic' (double-integrator / acceleration)."))
+    parser.add_argument('--obs_layout', type=str, default='legacy',
                         choices=list(UnifiedNavigationEnv.OBS_LAYOUTS),
-                        help=("Observation dict key layout. 'legacy' uses key 'last_velocity' "
-                              "(matches checkpoints trained before the rename). 'current' uses "
-                              "key 'robot_vel' (post-rename). The flat obs is built by sorting "
-                              "the dict keys, so this controls feature ordering."))
+                        help=("Observation key layout. 'legacy' uses 'last_velocity' "
+                              "(original replication). 'current' uses 'robot_vel'."))
+    parser.add_argument('--num_agents', type=int, default=None,
+                        help="Number of agents per world (default: config NUM_AGENTS=1)")
     return parser.parse_args()
+
+def find_run_dir_with_checkpoints(base_log_dir, run_name):
+    """Return the directory that contains model checkpoints for this run."""
+    candidates = [base_log_dir]
+    nested = os.path.join(base_log_dir, run_name)
+    if nested != base_log_dir:
+        candidates.append(nested)
+    for path in candidates:
+        if os.path.isdir(path) and any(
+            f.startswith("model_") and f.endswith(".pt") for f in os.listdir(path)
+        ):
+            return path
+    return base_log_dir
+
+def write_env_meta(run_dir, meta):
+    os.makedirs(run_dir, exist_ok=True)
+    path = os.path.join(run_dir, "env_meta.json")
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"--> Wrote env metadata to {path}")
 
 def train():
     """Initializes and runs the rsl-rl training process."""
@@ -43,6 +64,7 @@ def train():
         return
 
     args = parse_args() # Parse arguments
+    num_agents = args.num_agents if args.num_agents is not None else cfg['env']['num_agents']
 
     # Add environment type and timestamp to run name and experiment name for better tracking
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')    
@@ -66,11 +88,12 @@ def train():
     # --- Environment Setup ---
     num_envs = cfg['env']['num_envs']
     print(f"Run name updated to: {cfg['runner']['run_name']}")
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs']}
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents']}
 
     # Instantiate the selected environment
     vec_env = UnifiedNavigationEnv(
         num_envs=num_envs,
+        num_agents=num_agents,
         noise_level=0.0,
         use_cbf_action_filtering=args.use_cbf_action_filtering,
         use_cbf_reward_penalty=args.use_cbf_reward_penalty,
@@ -81,7 +104,9 @@ def train():
     print(f"--> Using UnifiedNavigationEnv as vectorized environment.")
     print(f"--> use_cbf_action_filtering: {args.use_cbf_action_filtering}")
     print(f"--> use_cbf_reward_penalty: {args.use_cbf_reward_penalty}")
+    print(f"--> dynamics_model: {args.dynamics_model}")
     print(f"--> obs_layout: {args.obs_layout}")
+    print(f"--> num_agents: {num_agents}")
     
     # add the ability to change run_name to be timestamped
     if not args.headless:
@@ -96,25 +121,19 @@ def train():
             device=cfg['device']
         )
         print("\nOnPolicyRunner initialized successfully.")
-        # print("--> Using NaiveNavigationEnv as vectorized environment.") # Removed redundant print
         print("--> Check TensorBoard for rollout and reward statistics.\n")
 
-        # Persist the env metadata that the policy was trained against so test.py
-        # can auto-load the right obs layout / dynamics model. The runner creates
-        # its own log subdir; we write into that same directory.
-        run_dir = os.path.join(base_log_dir, cfg['runner']['run_name'])
-        os.makedirs(run_dir, exist_ok=True)
+        run_dir = find_run_dir_with_checkpoints(base_log_dir, cfg['runner']['run_name'])
         meta = {
             "env": args.env,
             "obs_layout": args.obs_layout,
             "dynamics_model": args.dynamics_model,
+            "num_agents": num_agents,
             "use_cbf_action_filtering": bool(args.use_cbf_action_filtering),
             "use_cbf_reward_penalty": bool(args.use_cbf_reward_penalty),
         }
         try:
-            with open(os.path.join(run_dir, "env_meta.json"), "w") as f:
-                json.dump(meta, f, indent=2)
-            print(f"--> Wrote env metadata to {os.path.join(run_dir, 'env_meta.json')}")
+            write_env_meta(run_dir, meta)
         except Exception as e:
             print(f"Warning: failed to write env_meta.json: {e}")
 

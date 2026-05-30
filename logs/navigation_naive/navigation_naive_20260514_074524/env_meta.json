@@ -1,23 +1,6 @@
 {
   "obs_layout": "legacy",
   "dynamics_model": "quasi_static",
-  "_provenance": "Empirically probed retroactively (probe_checkpoints.py)",
-  "_probe_results": {
-    "legacy/quasi_static": {
-      "success_pct": 100.0,
-      "mean_reward": 2715.99
-    },
-    "legacy/dynamic": {
-      "success_pct": 80.0,
-      "mean_reward": 2568.7
-    },
-    "current/quasi_static": {
-      "success_pct": 0.0,
-      "mean_reward": 437.64
-    },
-    "current/dynamic": {
-      "success_pct": 0.0,
-      "mean_reward": 437.28
-    }
-  }
+  "num_agents": 1,
+  "_provenance": "Original single-agent replication (performance-test baseline)"
 }

@@ -8,9 +8,10 @@ import numpy as np # Added for observation size calculation
 ENV_ID = 'NaiveNavigation-v0' # Use the registered environment ID
 NUM_OBSTACLES = 3
 WORLD_SIZE = 10.0
-# Calculate expected flattened observation size
-# goal_pos(2) + obstacles(1*3, closest only) + robot_pos(2) + robot_vel(2)
-FLATTENED_OBS_SIZE = 2 + 3 + 2 + 2
+NUM_AGENTS = 1
+# goal_pos(2) + obstacles(NUM_OBSTACLES*3, closest only) + robot_pos(2) + last_velocity(2)
+# + other_agents((NUM_AGENTS-1)*3) when num_agents > 1
+FLATTENED_OBS_SIZE = 2 + (NUM_OBSTACLES * 3) + 2 + 2 + (NUM_AGENTS - 1) * 3
 
 # --- Configuration Definition ---
 cfg = {
@@ -23,6 +24,7 @@ cfg = {
         # Environment specific args (can be passed to gym.make via runner config)
         'world_size': WORLD_SIZE,
         'num_obstacles': NUM_OBSTACLES,
+        'num_agents': NUM_AGENTS,
         'max_acceleration': 2.0,
         'max_episode_steps': 1000, # Default max steps per episode
         'dt': 0.05, # Time step for the environment

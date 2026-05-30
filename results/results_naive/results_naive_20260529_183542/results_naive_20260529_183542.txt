@@ -1,0 +1,16 @@
+=== Evaluation Summary: NAIVE ===
+Timestamp:      20260529_183542
+Dynamics:       quasi_static
+Obs layout:     legacy
+CBF Filter:     False
+CBF Penalty:    False
+Agents:         1
+Obstacles:      3
+Episodes:       1000
+Mean Reward:    1873.17 +/- 757.37
+Success Rate:   48.30%
+Failures:       517 (51.70%)
+ - Obstacle:    321 (32.10%)
+ - Wall:        7 (0.70%)
+ - Timeout:     189 (18.90%)
+========================================

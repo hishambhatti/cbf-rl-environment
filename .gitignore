@@ -22,3 +22,4 @@ coverage/
 *.bk
 cbf_env/
 .venv/
+logs/

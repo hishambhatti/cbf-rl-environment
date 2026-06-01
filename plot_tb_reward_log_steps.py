@@ -223,6 +223,28 @@ class Series:
     times_sec: List[float]  # x-axis values (steps)
     values: List[float]
 
+def _auto_ylim_from_samples(
+    y_samples: List[np.ndarray],
+    percentiles: Tuple[float, float] = (1.0, 99.0),
+    margin_frac: float = 0.05,
+) -> Optional[Tuple[float, float]]:
+    """Compute y-limits from plotted values, ignoring extreme outliers."""
+    if not y_samples:
+        return None
+    arrays = [np.asarray(a, dtype=float) for a in y_samples if len(a)]
+    if not arrays:
+        return None
+    all_y = np.concatenate(arrays)
+    all_y = all_y[np.isfinite(all_y)]
+    if all_y.size == 0:
+        return None
+    lo, hi = np.percentile(all_y, percentiles)
+    if lo == hi:
+        pad = max(abs(lo) * margin_frac, 1.0)
+        return float(lo - pad), float(hi + pad)
+    pad = max((hi - lo) * margin_frac, 1.0)
+    return float(lo - pad), float(hi + pad)
+
 def to_series(
     scalars: Dict[str, List[Tuple[float, int, float]]],
     label: str,
@@ -307,6 +329,7 @@ def plot_series(
     colors_by_label: Dict[str, str] = {}
     # collect dashed collision line handles by method label
     coll_handle_map: Dict[str, object] = {}
+    ylim_samples: List[np.ndarray] = []
     
     for s in series_list:
         if not s.times_sec:
@@ -346,6 +369,8 @@ def plot_series(
                 )
         else:
             smoothed = y
+
+        ylim_samples.append(smoothed)
 
         # Plot smoothed line (main, with label)
         main_line, = plt.plot(
@@ -387,6 +412,8 @@ def plot_series(
                 alpha=0.15,
                 linewidth=0,
             )
+            ylim_samples.append(lo_env)
+            ylim_samples.append(hi_env)
 
     plt.xlabel("Step", fontsize=fs_label)
     plt.ylabel("Reward", fontsize=fs_label)
@@ -400,7 +427,9 @@ def plot_series(
     else:
         plt.yscale(yscale)
 
-    # Apply Y limits for primary axis (rewards) if provided
+    # Y limits: use explicit --ylim if given, else fit all plotted series.
+    if ylim is None:
+        ylim = _auto_ylim_from_samples(ylim_samples)
     if ylim is not None:
         plt.ylim(ylim)
 
@@ -817,8 +846,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         nargs=2,
         metavar=("YMIN", "YMAX"),
-        default=[200.0, 2200.0],
-        help="Primary y-axis limits (rewards) as two floats: YMIN YMAX (default: 200 2200)",
+        default=None,
+        help=(
+            "Primary y-axis limits (rewards) as YMIN YMAX. "
+            "If omitted, limits are auto-fit from plotted data (default)."
+        ),
     )
     parser.add_argument(
         "--collision-ylim",
@@ -1034,7 +1066,7 @@ def main() -> None:
         out_summary_path=out_summary,
         yscale=args.yscale,
         linthresh=args.linthresh,
-        ylim=(args.ylim[0], args.ylim[1]) if args.ylim else None,
+        ylim=(args.ylim[0], args.ylim[1]) if args.ylim is not None else None,
         collision_ylim=(args.collision_ylim[0], args.collision_ylim[1]) if args.collision_ylim else None,
         xlim=(args.xlim[0], args.xlim[1]) if args.xlim else None,
         smoothing=max(0.0, min(0.9999, args.smooth)),

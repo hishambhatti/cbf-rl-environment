@@ -35,6 +35,12 @@ def parse_args():
                               "(original replication). 'current' uses 'robot_vel'."))
     parser.add_argument('--num_agents', type=int, default=None,
                         help="Number of agents per world (default: config NUM_AGENTS=1)")
+    parser.add_argument('--control_noise', type=str,
+                        default=cfg['env'].get('control_noise', 'low'),
+                        choices=list(UnifiedNavigationEnv.CONTROL_NOISE_LEVELS),
+                        help=("Stochastic Gaussian noise level injected into the control input "
+                              "(velocity for quasi_static, acceleration for dynamic). "
+                              "'low' (default, legacy noise level), 'medium', or 'high' for ablation studies."))
     return parser.parse_args()
 
 def find_run_dir_with_checkpoints(base_log_dir, run_name):
@@ -88,7 +94,7 @@ def train():
     # --- Environment Setup ---
     num_envs = cfg['env']['num_envs']
     print(f"Run name updated to: {cfg['runner']['run_name']}")
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents']}
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents', 'control_noise']}
 
     # Instantiate the selected environment
     vec_env = UnifiedNavigationEnv(
@@ -99,6 +105,7 @@ def train():
         use_cbf_reward_penalty=args.use_cbf_reward_penalty,
         dynamics_model=args.dynamics_model,
         obs_layout=args.obs_layout,
+        control_noise=args.control_noise,
         **env_kwargs
     )
     print(f"--> Using UnifiedNavigationEnv as vectorized environment.")
@@ -107,6 +114,7 @@ def train():
     print(f"--> dynamics_model: {args.dynamics_model}")
     print(f"--> obs_layout: {args.obs_layout}")
     print(f"--> num_agents: {num_agents}")
+    print(f"--> control_noise: {args.control_noise}")
     
     # add the ability to change run_name to be timestamped
     if not args.headless:
@@ -131,6 +139,7 @@ def train():
             "num_agents": num_agents,
             "use_cbf_action_filtering": bool(args.use_cbf_action_filtering),
             "use_cbf_reward_penalty": bool(args.use_cbf_reward_penalty),
+            "control_noise": args.control_noise,
         }
         try:
             write_env_meta(run_dir, meta)

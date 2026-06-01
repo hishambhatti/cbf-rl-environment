@@ -26,6 +26,12 @@ class UnifiedNavigationEnv(VecEnv):
           vector is built by sorting dict keys alphabetically, so the key name affects
           feature ordering. Use ``obs_layout='legacy'`` for checkpoints trained on the
           original single-agent replication (key ``last_velocity``).
+
+    **Control-input noise:** ``control_noise`` ("low"/"medium"/"high") injects additive
+    Gaussian noise into the executed control (velocity for ``quasi_static``,
+    acceleration for ``dynamic``) for stochastic-robustness ablation studies. The
+    noise std is a fraction of the max control magnitude (see ``CONTROL_NOISE_STD``);
+    "low" reproduces the env's legacy default noise level.
     **Reward:** Combination of goal achievement bonus, collision penalty, and distance shaping (tensor).
     **Termination:** Episode ends if the robot reaches the goal or collides with an obstacle (tensor).
     **Truncation:** Can be handled by wrappers (e.g., TimeLimit).
@@ -33,6 +39,14 @@ class UnifiedNavigationEnv(VecEnv):
 
     OBS_LAYOUTS = ("legacy", "current")
     _OBS_VEL_KEY = {"legacy": "last_velocity", "current": "robot_vel"}
+
+    # Stochastic noise injected into the control input (velocity command for
+    # quasi_static, acceleration command for dynamic). Used for ablation studies.
+    # The value is the std of the additive Gaussian noise expressed as a fraction
+    # of the max control magnitude (max_velocity or max_acceleration). "low" is the
+    # env's legacy default noise level.
+    CONTROL_NOISE_LEVELS = ("low", "medium", "high")
+    CONTROL_NOISE_STD = {"low": 0.1, "medium": 0.3, "high": 0.5}
 
     # metadata and gym.Env inheritance removed
 
@@ -57,6 +71,7 @@ class UnifiedNavigationEnv(VecEnv):
         dynamics_model: str = "quasi_static",  # "dynamic" or "quasi_static"
         num_agents: int = 1,
         obs_layout: str = "legacy",  # "legacy" (last_velocity) or "current" (robot_vel)
+        control_noise: str = "low",  # "low" (legacy), "medium" or "high" (Gaussian control-input noise)
     ):
         """
         Initializes the UnifiedNavigationEnv.
@@ -104,6 +119,12 @@ class UnifiedNavigationEnv(VecEnv):
                 f"obs_layout must be one of {self.OBS_LAYOUTS}, got '{obs_layout}'"
             )
         self.obs_layout = obs_layout
+        if control_noise not in self.CONTROL_NOISE_LEVELS:
+            raise ValueError(
+                f"control_noise must be one of {self.CONTROL_NOISE_LEVELS}, got '{control_noise}'"
+            )
+        self.control_noise = control_noise
+        self.control_noise_std = self.CONTROL_NOISE_STD[control_noise]
 
         # Handle obstacle radii - Store as tensor (num_envs, num_obstacles)
         if isinstance(obstacle_radius, (list, np.ndarray, torch.Tensor)):
@@ -884,6 +905,10 @@ class UnifiedNavigationEnv(VecEnv):
                     agent_pos, clipped, ext_obs_pos, ext_obs_radii
                 )
                 applied = filtered if self.use_cbf_action_filtering else clipped
+                # Actuation noise on the velocity command (post-filter): the safe
+                # control is corrupted before it physically moves the robot.
+                if self.control_noise_std > 0.0:
+                    applied = applied + torch.randn_like(applied) * self.max_velocity * self.control_noise_std
                 noise = torch.randn_like(applied) * self.max_velocity * self.noise_level
                 new_pos = torch.clamp(
                     agent_pos + (applied + noise) * self.dt, 0.0, self.world_size
@@ -895,6 +920,9 @@ class UnifiedNavigationEnv(VecEnv):
                     agent_pos, agent_vel, clipped, ext_obs_pos, ext_obs_radii
                 )
                 applied = filtered if self.use_cbf_action_filtering else clipped
+                # Actuation noise on the acceleration command (post-filter).
+                if self.control_noise_std > 0.0:
+                    applied = applied + torch.randn_like(applied) * self.max_acceleration * self.control_noise_std
                 new_vel = torch.clamp(
                     agent_vel + applied * self.dt, -self.max_velocity, self.max_velocity
                 )

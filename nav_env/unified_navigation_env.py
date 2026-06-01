@@ -1104,6 +1104,13 @@ class UnifiedNavigationEnv(VecEnv):
 
         reset_indices = torch.where(done)[0]
         if len(reset_indices) > 0:
+            # Snapshot layout before auto-reset so eval/visualization can show the
+            # true terminal state (collision/goal/timeout) for this episode.
+            extras["terminal_layout"] = {
+                "robot_pos": self._robot_pos.clone(),
+                "goal_pos": self._goal_pos.clone(),
+                "obstacle_positions": self._obstacle_positions.clone(),
+            }
             self._reset_envs(reset_indices)
 
         if self.render_mode == "human":
@@ -1224,9 +1231,7 @@ class UnifiedNavigationEnv(VecEnv):
             return None
         elif self.render_mode == "rgb_array":
             self.figure.canvas.draw()
-            image = np.frombuffer(self.figure.canvas.tostring_rgb(), dtype="uint8")
-            width, height = self.figure.canvas.get_width_height()
-            image = image.reshape(height, width, 3)
+            image = np.asarray(self.figure.canvas.buffer_rgba())[:, :, :3].copy()
             # Note: Closing the figure here would prevent updates in subsequent calls.
             # Keep the figure object alive unless explicitly closing the env.
             return image

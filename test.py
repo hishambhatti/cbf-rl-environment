@@ -49,6 +49,11 @@ def parse_args():
                               "env_meta.json; falls back to 'legacy' (last_velocity)."))
     parser.add_argument('--num_agents', type=int, default=None,
                         help="Number of agents per world (default: config NUM_AGENTS=1)")
+    parser.add_argument('--control_noise', type=str, default=None,
+                        choices=list(UnifiedNavigationEnv.CONTROL_NOISE_LEVELS),
+                        help=("Stochastic Gaussian control-input noise level "
+                              "('low', 'medium', 'high'). If unset, auto-detected from "
+                              "env_meta.json; falls back to config default ('low')."))
     parser.add_argument(
         '--load_run', type=str, default=None,
         help=("Training run directory name (e.g. navigation_cbf_20260529_172331) or "
@@ -411,9 +416,20 @@ def test():
         resolved_num_agents = cfg['env']['num_agents']
     print(f"--> num_agents resolved to {resolved_num_agents}")
 
+    if args.control_noise is not None:
+        resolved_control_noise = args.control_noise
+        noise_source = "CLI flag --control_noise"
+    elif meta.get("control_noise") in UnifiedNavigationEnv.CONTROL_NOISE_LEVELS:
+        resolved_control_noise = meta["control_noise"]
+        noise_source = f"env_meta.json ({meta_path})"
+    else:
+        resolved_control_noise = cfg['env'].get('control_noise', 'low')
+        noise_source = "config default"
+    print(f"--> control_noise resolved to '{resolved_control_noise}' from {noise_source}")
+
     # --- Environment Setup ---
     render_mode = None if args.headless else ("human" if cfg['runner']['render_test'] else None)
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents']}
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents', 'control_noise']}
     eval_env = UnifiedNavigationEnv(
         render_mode=render_mode,
         num_envs=1,
@@ -424,6 +440,7 @@ def test():
         use_cbf_reward_penalty=args.use_cbf_reward_penalty,
         dynamics_model=resolved_dynamics_model,
         obs_layout=resolved_obs_layout,
+        control_noise=resolved_control_noise,
         **env_kwargs
     )
     print(f"--> Using UnifiedNavigationEnv for evaluation.")
@@ -680,6 +697,7 @@ def test():
         f"Training path:  {trained_model_log_dir}",
         f"Dynamics:       {resolved_dynamics_model}",
         f"Obs layout:     {resolved_obs_layout}",
+        f"Control noise:  {resolved_control_noise}",
         f"CBF Filter:     {args.use_cbf_action_filtering}",
         f"CBF Penalty:    {args.use_cbf_reward_penalty}",
         f"Agents:         {resolved_num_agents}",

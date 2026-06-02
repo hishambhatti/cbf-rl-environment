@@ -28,6 +28,10 @@ cfg = {
         'max_acceleration': 2.0,
         'max_episode_steps': 1000, # Default max steps per episode
         'dt': 0.05, # Time step for the environment
+        # Stochastic control-input noise level for ablation studies:
+        # 'low' (default, env's legacy noise level), 'medium', or 'high'.
+        # Overridable via the --control_noise CLI flag in train.py / test.py.
+        'control_noise': 'low',
         # Add other NaiveNavigationEnv args if needed (e.g., robot_radius)
         # 'make_env_func' is removed - we'll use env_id and wrap externally
     },

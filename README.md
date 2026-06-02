@@ -61,6 +61,13 @@ Pass these flags to `train.py` or `test.py` (the shell scripts forward `$@`):
 | `--dynamics_model` | `quasi_static`, `dynamic` | `quasi_static` | Single-integrator (velocity) vs double-integrator (acceleration) |
 | `--obs_layout` | `legacy`, `current` | `legacy` | `last_velocity` vs `robot_vel` obs key (affects flat obs ordering) |
 | `--num_agents` | integer ≥ 1 | `1` | Multi-agent: each agent sees other agents as dynamic obstacles |
+| `--control_noise` | `low`, `medium`, `high` | `low` | Gaussian noise injected into the control input (velocity for `quasi_static`, acceleration for `dynamic`) for stochastic-robustness ablations |
+
+The `--control_noise` levels map to a Gaussian std that is a fraction of the max
+control magnitude (`max_velocity` or `max_acceleration`): `low`=0.1, `medium`=0.3,
+`high`=0.5. `low` reproduces the env's legacy default noise level. These are defined
+in `UnifiedNavigationEnv.CONTROL_NOISE_STD` and the default level lives in
+`config.py` (`cfg['env']['control_noise']`).
 
 Examples:
 
@@ -70,6 +77,11 @@ Examples:
 
 # Multi-agent training with 2 robots per world
 ./train_cbf.sh --headless --num_agents 2
+
+# Control-input noise ablation (low / medium / high)
+./train_cbf.sh --headless --control_noise low
+./train_cbf.sh --headless --control_noise medium
+./train_cbf.sh --headless --control_noise high
 
 # Evaluate a run trained with non-default settings
 ./test_cbf.sh --headless --dynamics_model dynamic --num_agents 2

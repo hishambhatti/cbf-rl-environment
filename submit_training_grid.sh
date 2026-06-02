@@ -1,8 +1,8 @@
 #!/bin/bash
-# Batch all training grid experiments (28 total).
+# Batch all training grid experiments (68 total).
 #
-# Suite 1 (8): 4 training types × {quasi_static, dynamic}
-# Suite 2 (20): 4 training types × 5 (agents, obstacles) configs (sum=5), always dynamic
+# Suite 1 (8):  4 training types × {quasi_static, dynamic}
+# Suite 2 (60): 4 training types × 5 (agents, obstacles) configs (sum=5) × 3 noise levels (low, medium, high), always dynamic
 #
 # Uses the same ./train_*.sh wrappers you run by hand:
 #   ./submit_training_grid.sh --dry-run
@@ -25,12 +25,12 @@ HYAK_REPO_ROOT="${HYAK_REPO_ROOT:-/gscratch/scrubbed/jang1601/cbf-rl-environment
 CONDA_ENV="${CONDA_ENV:-/gscratch/scrubbed/jang1601/cbf-rl}"
 SKIP_ENV_SETUP="${SKIP_ENV_SETUP:-0}"
 
-SLURM_ACCOUNT="${SLURM_ACCOUNT:-}"
-SLURM_PARTITION="${SLURM_PARTITION:-gpu-a100}"
+SLURM_ACCOUNT="${SLURM_ACCOUNT:-stf}"
+SLURM_PARTITION="${SLURM_PARTITION:-gpu-2080ti}"
 SLURM_GPUS="${SLURM_GPUS:-1}"
 SLURM_CPUS="${SLURM_CPUS:-4}"
 SLURM_MEM="${SLURM_MEM:-32G}"
-SLURM_TIME="${SLURM_TIME:-24:00:00}"
+SLURM_TIME="${SLURM_TIME:-48:00:00}"
 
 # Use Hyak repo path when running under SLURM or when explicitly requested.
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || [[ "${USE_HYAK_PATHS:-0}" == "1" ]]; then
@@ -74,7 +74,7 @@ for dynamics in quasi_static dynamic; do
     done
 done
 
-# --- Suite 2: dynamic × training type × agents/obstacles grid (20) ---
+# --- Suite 2: dynamic × training type × agents/obstacles grid × noise (60) ---
 # num_agents + num_obstacles = 5
 AGENT_OBSTACLE_CONFIGS=(
     "1 4"
@@ -84,29 +84,34 @@ AGENT_OBSTACLE_CONFIGS=(
     "5 0"
 )
 
+NOISE_LEVELS=(low medium high)
+
 for train_type in "${TRAIN_TYPES[@]}"; do
     script="$(train_script "$train_type")"
     for config in "${AGENT_OBSTACLE_CONFIGS[@]}"; do
         read -r num_agents num_obstacles <<< "$config"
-        add_experiment \
-            "s2_${train_type}_dynamic_a${num_agents}_o${num_obstacles}" \
-            "$script" --dynamics_model dynamic \
-            --num_agents "$num_agents" \
-            --num_obstacles "$num_obstacles"
+        for noise in "${NOISE_LEVELS[@]}"; do
+            add_experiment \
+                "s2_${train_type}_dynamic_a${num_agents}_o${num_obstacles}_n${noise}" \
+                "$script" --dynamics_model dynamic \
+                --num_agents "$num_agents" \
+                --num_obstacles "$num_obstacles" \
+                --control_noise "$noise"
+        done
     done
 done
 
 NUM_EXPERIMENTS="${#EXPERIMENT_CMDS[@]}"
-if [[ "$NUM_EXPERIMENTS" -ne 28 ]]; then
-    echo "Internal error: expected 28 experiments, got $NUM_EXPERIMENTS" >&2
+if [[ "$NUM_EXPERIMENTS" -ne 68 ]]; then
+    echo "Internal error: expected 68 experiments, got $NUM_EXPERIMENTS" >&2
     exit 1
 fi
 
 suite_range() {
     case "${1:-all}" in
         1) echo "0-7" ;;
-        2) echo "8-27" ;;
-        all) echo "0-27" ;;
+        2) echo "8-67" ;;
+        all) echo "0-67" ;;
         *)
             echo "Unknown suite: $1 (use 1, 2, or all)" >&2
             exit 1

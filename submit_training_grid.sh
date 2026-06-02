@@ -132,6 +132,8 @@ setup_env() {
         cd "$REPO_ROOT"
         return 0
     fi
+    { conda deactivate 2>/dev/null || true; }
+    unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL 2>/dev/null || true
     module load conda
     conda activate "$CONDA_ENV"
     cd "$REPO_ROOT"
@@ -211,6 +213,9 @@ case "$MODE" in
 #SBATCH --error=${HYAK_REPO_ROOT}/logs/slurm/cbf_nav_grid_%A_%a.err
 
 set -euo pipefail
+# Deactivate any conda env sourced by .bashrc before loading the module.
+{ conda deactivate 2>/dev/null || true; }
+unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL 2>/dev/null || true
 module load conda
 conda activate ${CONDA_ENV}
 cd ${HYAK_REPO_ROOT}

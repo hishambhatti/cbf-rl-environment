@@ -213,6 +213,7 @@ case "$MODE" in
 #SBATCH --error=${HYAK_REPO_ROOT}/logs/slurm/cbf_nav_grid_%A_%a.err
 
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 # Deactivate any conda env sourced by .bashrc before loading the module.
 { conda deactivate 2>/dev/null || true; }
 unset CONDA_PREFIX CONDA_DEFAULT_ENV CONDA_SHLVL 2>/dev/null || true

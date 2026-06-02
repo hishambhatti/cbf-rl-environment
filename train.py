@@ -41,7 +41,13 @@ def parse_args():
                         help=("Stochastic Gaussian noise level injected into the control input "
                               "(velocity for quasi_static, acceleration for dynamic). "
                               "'low' (default, legacy noise level), 'medium', or 'high' for ablation studies."))
+    parser.add_argument('--num_obstacles', type=int, default=None,
+                        help="Number of static obstacles per world (default: config NUM_OBSTACLES=3)")
     return parser.parse_args()
+
+def flattened_obs_size(num_obstacles: int, num_agents: int) -> int:
+    """Match UnifiedNavigationEnv flat obs: goal(2) + closest obs(3*O) + pos(2) + vel(2) + other agents."""
+    return 2 + (num_obstacles * 3) + 2 + 2 + (num_agents - 1) * 3
 
 def find_run_dir_with_checkpoints(base_log_dir, run_name):
     """Return the directory that contains model checkpoints for this run."""
@@ -71,6 +77,9 @@ def train():
 
     args = parse_args() # Parse arguments
     num_agents = args.num_agents if args.num_agents is not None else cfg['env']['num_agents']
+    num_obstacles = (
+        args.num_obstacles if args.num_obstacles is not None else cfg['env']['num_obstacles']
+    )
 
     # Add environment type and timestamp to run name and experiment name for better tracking
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')    
@@ -82,7 +91,7 @@ def train():
     print(f"Experiment Name: {cfg['runner']['experiment_name']}")
     print(f"Device: {cfg['device']}")
     print(f"Environment: {args.env.upper()}NavigationEnv (vectorized)") # Use parsed env name
-    print(f"Observation Size (Flattened): {FLATTENED_OBS_SIZE}")
+    print(f"Observation Size (Flattened): {flattened_obs_size(num_obstacles, num_agents)}")
     print(f"Number of Parallel Environments: {cfg['env']['num_envs']}")
     print(f"Max Training Iterations: {cfg['runner']['max_iterations']}")
 
@@ -95,6 +104,7 @@ def train():
     num_envs = cfg['env']['num_envs']
     print(f"Run name updated to: {cfg['runner']['run_name']}")
     env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents', 'control_noise']}
+    env_kwargs['num_obstacles'] = num_obstacles
 
     # Instantiate the selected environment
     vec_env = UnifiedNavigationEnv(
@@ -115,6 +125,7 @@ def train():
     print(f"--> obs_layout: {args.obs_layout}")
     print(f"--> num_agents: {num_agents}")
     print(f"--> control_noise: {args.control_noise}")
+    print(f"--> num_obstacles: {num_obstacles}")
     
     # add the ability to change run_name to be timestamped
     if not args.headless:
@@ -137,6 +148,7 @@ def train():
             "obs_layout": args.obs_layout,
             "dynamics_model": args.dynamics_model,
             "num_agents": num_agents,
+            "num_obstacles": num_obstacles,
             "use_cbf_action_filtering": bool(args.use_cbf_action_filtering),
             "use_cbf_reward_penalty": bool(args.use_cbf_reward_penalty),
             "control_noise": args.control_noise,

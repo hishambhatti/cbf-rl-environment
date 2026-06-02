@@ -138,7 +138,72 @@ Or run `test.py` directly. For example:
 python test.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty --headless
 ```
 
-The test script automatically finds the latest run directory for the specified environment type and loads the latest checkpoint. It will play out the scenario visually (unless run with `--headless`) and output success rate and failure reasons (e.g., collisions).
+By default, `test.py` loads the **latest training run** for the selected `--env` and the **latest checkpoint** (`model_*.pt`) in that run. Results are written under `results/results_<env>/` and include the training run name and checkpoint in both the folder name and the summary `.txt`.
+
+### Selecting a training run or checkpoint
+
+Pass these flags through the shell scripts (`$@` is forwarded):
+
+| Flag | Example | What it does |
+|------|---------|--------------|
+| `--load_run` | `navigation_cbf_20260529_172331` | Training run folder under `logs/navigation_<env>/` (name or full path) |
+| `--checkpoint` | `976` or `model_976.pt` | Checkpoint iteration or filename (default: latest) |
+
+Examples:
+
+```bash
+# Evaluate a specific training run (latest checkpoint in that run)
+./test_cbf.sh --headless --load_run navigation_cbf_20260529_172331
+
+# Evaluate an earlier checkpoint from that run
+./test_cbf.sh --headless --load_run navigation_cbf_20260529_172331 --checkpoint 976
+
+# Same, using the checkpoint filename
+./test_naive.sh --headless --load_run navigation_naive_20260529_161714 --checkpoint model_976.pt
+```
+
+### Saving episode videos and trajectory plots
+
+When **not** using `--headless`, `test.py` shows the live matplotlib window. With or without `--headless`, episode media can be saved every *N* episodes (default `N=100`, i.e. episodes 100, 200, …, 1000 for a 1000-episode eval):
+
+| Flag | Default | What it does |
+|------|---------|--------------|
+| `--save_video_interval` | `100` | Save trajectory PNG + MP4 every N episodes. Set `0` to disable. |
+
+Files are saved under `results/results_<env>/<result_run>/episodes/` with names like:
+
+```text
+navigation_cbf_20260529_172331_0100_success.png
+navigation_cbf_20260529_172331_0100_success.mp4
+navigation_cbf_20260529_172331_0050_obstacle_collision.png
+navigation_cbf_20260529_172331_0050_obstacle_collision.mp4
+```
+
+Outcome suffixes: `success`, `obstacle_collision`, `wall_collision`, `timeout`.
+
+Example (headless eval with saved media every 100 episodes):
+
+```bash
+./test_cbf.sh --headless --load_run navigation_cbf_20260529_172331 --checkpoint 1499 --save_video_interval 100
+```
+
+Example (visual eval with live window):
+
+```bash
+./test_cbf.sh --load_run navigation_cbf_20260529_172331 --checkpoint 1499 --save_video_interval 100
+```
+
+MP4 export tries matplotlib + system `ffmpeg` first. If that is not available, it falls back to optional `imageio` + `imageio-ffmpeg` (`pip install imageio imageio-ffmpeg`). The trajectory PNG is always saved.
+
+The summary `.txt` now records the evaluated training run and checkpoint, for example:
+
+```text
+Training run:   navigation_cbf_20260529_172331
+Checkpoint:     model_1499.pt
+Training path:  logs/navigation_cbf/navigation_cbf_20260529_172331
+```
+
+The test script plays out scenarios visually (unless run with `--headless`) and outputs success rate and failure reasons (e.g., collisions).
 
 ### Backward compatibility for older checkpoints
 

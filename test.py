@@ -5,6 +5,7 @@ import os
 import re # Import re for potential pattern matching if needed
 import json
 import argparse # Import argparse
+from datetime import datetime
 
 from config import cfg, get_log_dir, FLATTENED_OBS_SIZE
 
@@ -53,6 +54,21 @@ def parse_args():
                         help=("Stochastic Gaussian control-input noise level "
                               "('low', 'medium', 'high'). If unset, auto-detected from "
                               "env_meta.json; falls back to config default ('low')."))
+    parser.add_argument(
+        '--load_run', type=str, default=None,
+        help=("Training run directory name (e.g. navigation_cbf_20260529_172331) or "
+              "full path under logs/navigation_<env>/. Default: latest run for --env."),
+    )
+    parser.add_argument(
+        '--checkpoint', type=str, default=None,
+        help=("Checkpoint to evaluate: iteration number (e.g. 976), "
+              "model_976.pt, or path to a .pt file. Default: latest in run dir."),
+    )
+    parser.add_argument(
+        '--save_video_interval', type=int, default=100,
+        help=("Save trajectory PNG + MP4 every N episodes (e.g. 50, 100, ...). "
+              "Set to 0 to disable. Works with or without --headless. Default: 100."),
+    )
     return parser.parse_args()
 
 def find_latest_run_dir(base_log_dir, env_type):
@@ -83,6 +99,261 @@ def find_env_meta_path(run_dir):
         return nested
     return direct
 
+def resolve_run_dir(base_log_dir, env_type, load_run_arg):
+    """Resolve training run directory from CLI arg or latest match."""
+    if load_run_arg is not None:
+        if os.path.isdir(load_run_arg):
+            return os.path.abspath(load_run_arg)
+        candidate = os.path.join(base_log_dir, load_run_arg)
+        if os.path.isdir(candidate):
+            return candidate
+        raise FileNotFoundError(
+            f"Training run directory not found: {load_run_arg} (also tried {candidate})"
+        )
+
+    latest_run_subdir = find_latest_run_dir(base_log_dir, env_type)
+    if latest_run_subdir is not None:
+        return latest_run_subdir
+
+    latest_run_subdir = find_latest_run_dir(base_log_dir, "")
+    if latest_run_subdir is not None:
+        return latest_run_subdir
+
+    raise FileNotFoundError(f"No suitable run directory found in {base_log_dir}")
+
+def resolve_checkpoint_path(run_dir, checkpoint_arg):
+    """Resolve checkpoint file from CLI arg or latest model_*.pt in run_dir."""
+    if checkpoint_arg is None:
+        checkpoints = [
+            f for f in os.listdir(run_dir)
+            if f.startswith("model_") and f.endswith(".pt")
+        ]
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoint files found in {run_dir}")
+        checkpoints.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
+        return os.path.join(run_dir, checkpoints[-1])
+
+    if os.path.isfile(checkpoint_arg):
+        return os.path.abspath(checkpoint_arg)
+
+    candidate = os.path.join(run_dir, checkpoint_arg)
+    if os.path.isfile(candidate):
+        return candidate
+
+    if checkpoint_arg.startswith("model_") and checkpoint_arg.endswith(".pt"):
+        raise FileNotFoundError(f"Checkpoint file not found: {candidate}")
+
+    iteration = int(checkpoint_arg)
+    path = os.path.join(run_dir, f"model_{iteration}.pt")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
+    return path
+
+def episode_outcome_label(success_flag, collided_obstacle_flag, collided_wall_flag):
+    if success_flag:
+        return "success"
+    if collided_obstacle_flag:
+        return "obstacle_collision"
+    if collided_wall_flag:
+        return "wall_collision"
+    return "timeout"
+
+def _capture_episode_layout(eval_env):
+    """Freeze world-0 layout at episode start for trajectory rendering."""
+    return {
+        "goal_pos": eval_env._goal_pos[0].detach().cpu().numpy().copy(),
+        "obstacle_pos": eval_env._obstacle_positions[0].detach().cpu().numpy().copy(),
+        "obstacle_radii": eval_env._obstacle_radii[0].detach().cpu().numpy().copy(),
+        "world_size": eval_env.world_size,
+        "robot_radius": eval_env.robot_radius,
+        "goal_radius": eval_env.goal_radius,
+    }
+
+def _terminal_robot_pos(extras, eval_env):
+    """Robot positions at episode end, before the env auto-resets."""
+    terminal = extras.get("terminal_layout")
+    if terminal is not None:
+        return terminal["robot_pos"][0].detach().cpu().numpy()
+    return eval_env._robot_pos[0].detach().cpu().numpy()
+
+def _draw_episode_scene(ax, episode_layout, trajectories, step_idx, outcome_label):
+    """Draw obstacles, goals, dashed trajectories, and robots at step_idx."""
+    import matplotlib.patches as patches
+
+    goal_pos = episode_layout["goal_pos"]
+    obstacle_pos = episode_layout["obstacle_pos"]
+    obstacle_radii = episode_layout["obstacle_radii"]
+    world_size = episode_layout["world_size"]
+    robot_radius = episode_layout["robot_radius"]
+    goal_radius = episode_layout["goal_radius"]
+    ax.set_xlim(0, world_size)
+    ax.set_ylim(0, world_size)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlabel("X Position")
+    ax.set_ylabel("Y Position")
+    ax.set_title(f"Episode trajectory ({outcome_label.replace('_', ' ')})")
+
+    for i, (ox, oy) in enumerate(obstacle_pos):
+        radius = float(obstacle_radii[i])
+        ax.add_patch(patches.Circle((ox, oy), radius, fc="red", alpha=0.6))
+
+    agent_colors = ["blue", "royalblue", "deepskyblue", "steelblue"]
+    goal_colors = ["green", "limegreen", "forestgreen", "darkgreen"]
+    for agent_idx, traj in enumerate(trajectories):
+        traj_np = np.asarray(traj, dtype=np.float32)
+        if len(traj_np) == 0:
+            continue
+        color = agent_colors[agent_idx % len(agent_colors)]
+        goal_color = goal_colors[agent_idx % len(goal_colors)]
+        ax.plot(
+            traj_np[:, 0], traj_np[:, 1], "--", color=color,
+            alpha=0.8, linewidth=1.5, label=f"Agent {agent_idx} path",
+        )
+        ax.plot(traj_np[0, 0], traj_np[0, 1], "o", color=color, markersize=8, label=f"Agent {agent_idx} start")
+        end_idx = min(step_idx, len(traj_np) - 1)
+        ax.plot(traj_np[end_idx, 0], traj_np[end_idx, 1], "x", color=color, markersize=10)
+        ax.add_patch(patches.Circle(
+            (goal_pos[agent_idx, 0], goal_pos[agent_idx, 1]),
+            goal_radius, fc=goal_color, alpha=0.8,
+        ))
+        ax.add_patch(patches.Circle(
+            (traj_np[end_idx, 0], traj_np[end_idx, 1]),
+            robot_radius, fc=color, alpha=0.8,
+        ))
+
+    ax.legend(loc="upper right", fontsize=8)
+
+def _fig_to_rgb(fig):
+    """Return an RGB uint8 array from a matplotlib figure (mpl 3.10+ compatible)."""
+    fig.canvas.draw()
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    return rgba[:, :, :3].copy()
+
+def render_episode_frame(episode_layout, trajectories, step_idx, outcome_label):
+    """Render one animation frame and return an RGB uint8 array."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    _draw_episode_scene(ax, episode_layout, trajectories, step_idx, outcome_label)
+    frame = _fig_to_rgb(fig)
+    plt.close(fig)
+    return frame
+
+def save_trajectory_image(episode_layout, trajectories, outcome_label, output_path):
+    """Save a static PNG with the full dashed trajectory."""
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    final_step = max((len(traj) for traj in trajectories), default=1) - 1
+    _draw_episode_scene(ax, episode_layout, trajectories, final_step, outcome_label)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=120)
+    plt.close(fig)
+
+def _flush_file(path):
+    """Ensure a file is visible on disk (helps on NFS and after interrupt)."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        os.fsync(fd)
+        os.close(fd)
+    except OSError:
+        pass
+
+def _video_frame_indices(num_steps, max_frames=150):
+    """Subsample trajectory indices for MP4 (timeouts can be 1000+ steps)."""
+    if num_steps <= max_frames:
+        return list(range(num_steps))
+    indices = np.linspace(0, num_steps - 1, max_frames, dtype=int)
+    return sorted(set(indices.tolist()))
+
+def _pad_frames_for_h264(frames, block=16):
+    """Pad frames so width/height are divisible by 16 (avoids ffmpeg resize warnings)."""
+    padded_frames = []
+    for frame in frames:
+        h, w = frame.shape[:2]
+        nh = ((h + block - 1) // block) * block
+        nw = ((w + block - 1) // block) * block
+        if nh == h and nw == w:
+            padded_frames.append(frame)
+            continue
+        out = np.zeros((nh, nw, 3), dtype=np.uint8)
+        out[:h, :w] = frame
+        padded_frames.append(out)
+    return padded_frames
+
+def save_mp4(frames, mp4_path, fps=20):
+    """Save RGB frames to MP4 via matplotlib+ffmpeg, or imageio if available."""
+    frames = _pad_frames_for_h264(frames)
+    errors = []
+
+    try:
+        import matplotlib.pyplot as plt
+        from matplotlib.animation import FFMpegWriter, FuncAnimation
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.axis("off")
+        im = ax.imshow(frames[0])
+
+        def _update(i):
+            im.set_array(frames[i])
+            return [im]
+
+        anim = FuncAnimation(fig, _update, frames=len(frames), blit=True)
+        anim.save(mp4_path, writer=FFMpegWriter(fps=fps))
+        plt.close(fig)
+        return
+    except Exception as e:
+        errors.append(str(e))
+
+    try:
+        import imageio
+        imageio.mimsave(mp4_path, frames, fps=fps)
+        return
+    except ImportError:
+        errors.append("imageio not installed")
+    except Exception as e:
+        errors.append(f"imageio: {e}")
+
+    raise RuntimeError(
+        "Could not write MP4 (need ffmpeg on PATH, or pip install imageio imageio-ffmpeg). "
+        + "; ".join(errors)
+    )
+
+def save_episode_media(episode_layout, trajectories, outcome_label, base_path, fps=20, max_video_frames=150):
+    """Save trajectory PNG and MP4 for one recorded episode."""
+    if not trajectories or all(len(traj) == 0 for traj in trajectories):
+        return
+
+    num_steps = max(len(traj) for traj in trajectories)
+    png_path = f"{base_path}.png"
+    mp4_path = f"{base_path}.mp4"
+
+    # PNG first so it appears on disk immediately (before slow video rendering).
+    save_trajectory_image(episode_layout, trajectories, outcome_label, png_path)
+    _flush_file(png_path)
+    print(f"  Saved PNG: {png_path}", flush=True)
+
+    frame_indices = _video_frame_indices(num_steps, max_frames=max_video_frames)
+    if len(frame_indices) < num_steps:
+        print(
+            f"  Rendering MP4 with {len(frame_indices)}/{num_steps} subsampled frames...",
+            flush=True,
+        )
+    else:
+        print(f"  Rendering MP4 with {len(frame_indices)} frames...", flush=True)
+
+    frames = [
+        render_episode_frame(episode_layout, trajectories, step_idx, outcome_label)
+        for step_idx in frame_indices
+    ]
+
+    try:
+        save_mp4(frames, mp4_path, fps=fps)
+        _flush_file(mp4_path)
+        print(f"  Saved MP4: {mp4_path}", flush=True)
+    except Exception as e:
+        print(f"  Warning: could not save MP4 to {mp4_path} ({e}). PNG is at {png_path}.", flush=True)
+
 def test():
     if not _RSL_RL_AVAILABLE:
         return
@@ -98,30 +369,12 @@ def test():
     # --- Locate run directory first so we can read env_meta.json before building env
     base_log_dir = get_log_dir()
     base_log_dir = os.path.dirname(base_log_dir)
-    if cfg['runner']['load_run'] == -1:
-        latest_run_subdir = find_latest_run_dir(base_log_dir, args.env)
-        if latest_run_subdir is not None:
-             trained_model_log_dir = latest_run_subdir
-             print(f"Found latest run directory for '{args.env}' env: {trained_model_log_dir}")
-        else:
-             print(f"Warning: No run subdirectories found for '{args.env}' env in {base_log_dir}. Trying generic latest.")
-             latest_run_subdir = find_latest_run_dir(base_log_dir, "")
-             if latest_run_subdir:
-                 trained_model_log_dir = latest_run_subdir
-                 print(f"Found generic latest run directory: {trained_model_log_dir}")
-             else:
-                 print(f"Error: No suitable run directory found in {base_log_dir}")
-                 return
-    else:
-        run_name = str(cfg['runner']['load_run'])
-        if f"_{args.env}_" not in run_name:
-            print(f"Warning: 'load_run' value '{run_name}' might not correspond to the selected env '{args.env}'.")
-        trained_model_log_dir = os.path.join(base_log_dir, run_name)
-
-    print(f"Attempting to load model from checkpoint in: {trained_model_log_dir}")
-    if not os.path.isdir(trained_model_log_dir):
-         print(f"Error: Log directory not found: {trained_model_log_dir}")
-         return
+    try:
+        trained_model_log_dir = resolve_run_dir(base_log_dir, args.env, args.load_run)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return
+    print(f"Using training run directory: {trained_model_log_dir}")
 
     meta_path = find_env_meta_path(trained_model_log_dir)
     meta = {}
@@ -175,7 +428,7 @@ def test():
     print(f"--> control_noise resolved to '{resolved_control_noise}' from {noise_source}")
 
     # --- Environment Setup ---
-    render_mode = "human" if cfg['runner']['render_test'] else None
+    render_mode = None if args.headless else ("human" if cfg['runner']['render_test'] else None)
     env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents', 'control_noise']}
     eval_env = UnifiedNavigationEnv(
         render_mode=render_mode,
@@ -198,27 +451,16 @@ def test():
     print(f"Evaluation Environment Observation Dict Keys: {extras['observations'].keys()}")
 
     # --- Determine checkpoint path ---
-    cfg['runner']['checkpoint'] = -1 #1500
-    if cfg['runner']['checkpoint'] == -1:
-        try:
-            checkpoints = [f for f in os.listdir(trained_model_log_dir) if f.startswith('model_') and f.endswith('.pt')]
-            if not checkpoints:
-                print(f"Error: No checkpoint files found in {trained_model_log_dir}")
-                eval_env.close()
-                return
-            checkpoints.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
-            checkpoint_path = os.path.join(trained_model_log_dir, checkpoints[-1])
-        except Exception as e:
-            print(f"Error finding latest checkpoint: {e}")
-            eval_env.close()
-            return
-    else:
-        checkpoint_path = os.path.join(trained_model_log_dir, f"model_{cfg['runner']['checkpoint']}.pt")
-
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: Checkpoint file not found: {checkpoint_path}")
+    try:
+        checkpoint_path = resolve_checkpoint_path(trained_model_log_dir, args.checkpoint)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
         eval_env.close()
         return
+
+    checkpoint_name = os.path.basename(checkpoint_path)
+    training_run_name = os.path.basename(trained_model_log_dir)
+    checkpoint_stem = os.path.splitext(checkpoint_name)[0]
     print(f"Loading checkpoint: {checkpoint_path}")
 
     try:
@@ -269,14 +511,38 @@ def test():
     total_successes = 0
     num_episodes = cfg['runner']['test_episodes']
     if args.headless:
-        eval_env.render_mode = "headless"
+        eval_env.render_mode = None
     failure_counts = {'obstacle': 0, 'wall': 0, 'timeout': 0}
+    save_video_interval = args.save_video_interval
+    record_episode_media = save_video_interval > 0
+    if record_episode_media:
+        print(f"Saving episode PNG + MP4 every {save_video_interval} episodes.")
+
+    eval_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    result_run_name = (
+        f"results_{args.env}_{training_run_name}_{checkpoint_stem}_{eval_timestamp}"
+    )
+    result_dir = os.path.join("results", f"results_{args.env}", result_run_name)
+    media_dir = os.path.join(result_dir, "episodes")
+    if record_episode_media:
+        os.makedirs(media_dir, exist_ok=True)
+        print(f"Episode media directory: {media_dir}", flush=True)
 
     for episode in range(num_episodes):
         obs_tensor, extras = eval_env.reset(seed=cfg['seed'] + episode)
         initial_robot_pos = extras.get('robot_position', None)
         initial_goal_pos = extras.get('goal_position', None)
         initial_obstacle_positions = extras.get('obstacle_positions', None)
+        should_record = record_episode_media and ((episode + 1) % save_video_interval == 0)
+        trajectories = None
+        episode_layout = None
+        if should_record:
+            num_agents = eval_env.num_agents
+            episode_layout = _capture_episode_layout(eval_env)
+            trajectories = [[] for _ in range(num_agents)]
+            robot_start = eval_env._robot_pos[0].detach().cpu().numpy()
+            for agent_idx in range(num_agents):
+                trajectories[agent_idx].append(robot_start[agent_idx].copy())
 
         initial_h_robot, initial_h_goal = None, None
         try:
@@ -319,6 +585,16 @@ def test():
             episode_reward += reward_tensor.sum().item()
             step_count += 1
 
+            if should_record and trajectories is not None:
+                if done_tensor.any():
+                    robot_step = _terminal_robot_pos(extras, eval_env)
+                else:
+                    robot_step = eval_env._robot_pos[0].detach().cpu().numpy()
+                for agent_idx in range(eval_env.num_agents):
+                    trajectories[agent_idx].append(robot_step[agent_idx].copy())
+                if eval_env.render_mode == "human":
+                    eval_env.render()
+
         total_rewards.append(episode_reward)
         success_flag = False
         if 'log' in extras and 'success' in extras['log']:
@@ -348,11 +624,19 @@ def test():
             else:
                 failure_counts['timeout'] += 1
 
-        print(f"Episode {episode + 1}/{num_episodes} finished in {step_count} steps. Reward: {episode_reward:.2f}. Success: {success_flag}")
+        outcome_label = episode_outcome_label(
+            success_flag, collided_obstacle_flag, collided_wall_flag
+        )
+
+        print(
+            f"Episode {episode + 1}/{num_episodes} finished in {step_count} steps. "
+            f"Reward: {episode_reward:.2f}. Success: {success_flag}",
+            flush=True,
+        )
 
         if not success_flag:
             reason = "obstacle collision" if collided_obstacle_flag else ("wall collision" if collided_wall_flag else "timeout")
-            print(f"Failure reason: {reason}")
+            print(f"Failure reason: {reason}", flush=True)
             try:
                 if initial_h_robot is not None:
                     h_r = float(initial_h_robot.flatten()[0].item())
@@ -362,31 +646,42 @@ def test():
                     h_g = float(initial_h_goal.flatten()[0].item())
                 else:
                     h_g = None
-                print(f"Initial h(robot): {h_r if h_r is not None else 'N/A'}, h(goal): {h_g if h_g is not None else 'N/A'}")
+                print(f"Initial h(robot): {h_r if h_r is not None else 'N/A'}, h(goal): {h_g if h_g is not None else 'N/A'}", flush=True)
             except Exception as e:
-                print(f"Warning: could not print initial h values: {e}")
+                print(f"Warning: could not print initial h values: {e}", flush=True)
 
-            if getattr(eval_env, "render_mode", None) == "human":
-                try:
-                    if initial_robot_pos is not None:
-                        if eval_env.num_agents > 1:
-                            eval_env._robot_pos = initial_robot_pos.reshape(eval_env._num_parallel_envs, eval_env.num_agents, 2).clone().to(eval_env.device)
-                        else:
-                            eval_env._robot_pos = initial_robot_pos.clone().to(eval_env.device)
-                    if initial_goal_pos is not None:
-                        if eval_env.num_agents > 1:
-                            eval_env._goal_pos = initial_goal_pos.reshape(eval_env._num_parallel_envs, eval_env.num_agents, 2).clone().to(eval_env.device)
-                        else:
-                            eval_env._goal_pos = initial_goal_pos.clone().to(eval_env.device)
-                    if initial_obstacle_positions is not None:
-                        eval_env._obstacle_positions = initial_obstacle_positions.reshape(eval_env._num_parallel_envs, eval_env.num_obstacles, 2).clone().to(eval_env.device)
-                    if hasattr(eval_env, "_robot_vel") and eval_env._robot_vel is not None:
-                        eval_env._robot_vel[:] = 0
-                    if hasattr(eval_env, "_elapsed_steps") and eval_env._elapsed_steps is not None:
-                        eval_env._elapsed_steps[:] = 0
-                    eval_env.render()
-                except Exception as e:
-                    print(f"Warning: could not re-render initial setup: {e}")
+        if should_record and trajectories is not None and episode_layout is not None:
+            media_base = os.path.join(
+                media_dir,
+                f"{training_run_name}_{episode + 1:04d}_{outcome_label}",
+            )
+            print(f"Saving media for episode {episode + 1}...", flush=True)
+            save_episode_media(episode_layout, trajectories, outcome_label, media_base)
+
+        if not success_flag and getattr(eval_env, "render_mode", None) == "human":
+            try:
+                P, A = eval_env._num_parallel_envs, eval_env.num_agents
+                O = eval_env.num_obstacles
+                if initial_robot_pos is not None:
+                    eval_env._robot_pos = (
+                        initial_robot_pos.reshape(P, A, 2).clone().to(eval_env.device)
+                    )
+                if initial_goal_pos is not None:
+                    eval_env._goal_pos = (
+                        initial_goal_pos.reshape(P, A, 2).clone().to(eval_env.device)
+                    )
+                if initial_obstacle_positions is not None:
+                    eval_env._obstacle_positions = (
+                        initial_obstacle_positions.reshape(P, A, O, 2)[:, 0, :, :]
+                        .clone().to(eval_env.device)
+                    )
+                if hasattr(eval_env, "_robot_vel") and eval_env._robot_vel is not None:
+                    eval_env._robot_vel[:] = 0
+                if hasattr(eval_env, "_elapsed_steps") and eval_env._elapsed_steps is not None:
+                    eval_env._elapsed_steps[:] = 0
+                eval_env.render()
+            except Exception as e:
+                print(f"Warning: could not re-render initial setup: {e}", flush=True)
 
     eval_env.close()
 
@@ -394,12 +689,12 @@ def test():
     std_reward = np.std(total_rewards) if total_rewards else 0.0
     success_rate = (total_successes / num_episodes) if num_episodes > 0 else 0.0
     fail_total = num_episodes - total_successes
-    from datetime import datetime
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_name = f"results_{args.env}_{timestamp}"
     summary_lines = [
         f"=== Evaluation Summary: {args.env.upper()} ===",
-        f"Timestamp:      {timestamp}",
+        f"Timestamp:      {eval_timestamp}",
+        f"Training run:   {training_run_name}",
+        f"Checkpoint:     {checkpoint_name}",
+        f"Training path:  {trained_model_log_dir}",
         f"Dynamics:       {resolved_dynamics_model}",
         f"Obs layout:     {resolved_obs_layout}",
         f"Control noise:  {resolved_control_noise}",
@@ -419,17 +714,15 @@ def test():
 
     print("\n" + "\n".join(summary_lines))
 
-    result_dir = os.path.join("results", f"results_{args.env}", run_name)
     os.makedirs(result_dir, exist_ok=True)
-    result_path = os.path.join(result_dir, f"{run_name}.txt")
+    result_path = os.path.join(result_dir, f"{result_run_name}.txt")
     with open(result_path, "w") as f:
         f.write("\n".join(summary_lines) + "\n")
     print(f"Results saved to {result_path}")
+    if record_episode_media:
+        print(f"Episode media saved under {media_dir}")
 
 
 if __name__ == '__main__':
-    cfg['runner']['load_run'] = -1
-    cfg['runner']['checkpoint'] = -1
     cfg['runner']['render_test'] = True
-
     test()

@@ -295,188 +295,31 @@ class UnifiedNavigationEnv(VecEnv):
         )  # (P, num_obstacles)
 
         for env_idx in range(P):
-            placement_attempts = 0
-            max_placement_attempts = 100  # Increased attempts might be needed
-            valid_placement = False
-            min_obstacle_separation_buffer = (
-                0.5  # Define minimum buffer between obstacles
-            )
-            min_robot_goal_distance = (
-                self.world_size / 3.0
-            )  # Minimum distance between robot and goal start
-            # Get radii for the current environment
-            current_env_obstacle_radii = obstacle_radii_np[
-                env_idx
-            ]  # Shape (num_obstacles,)
-            current_env_max_obstacle_radius = (
-                np.max(current_env_obstacle_radii) if self.num_obstacles > 0 else 0.0
-            )
-
-            while not valid_placement and placement_attempts < max_placement_attempts:
-                placement_attempts += 1
-
-                # 1. Place Obstacles
-                if options and options.get("obstacle_pos") is not None:
-                    obs_pos = np.array(options["obstacle_pos"], dtype=np.float32)
-                elif self.num_obstacles > 0:
-                    obs_pos = self.np_random.uniform(
-                        current_env_max_obstacle_radius,
-                        self.world_size - current_env_max_obstacle_radius,
-                        size=(self.num_obstacles, 2),
-                    ).astype(np.float32)
-                else:
-                    obs_pos = np.empty((0, 2), dtype=np.float32)
-
-                # 2. Check Obstacles vs Obstacles
-                obstacles_clear = True
-                if self.num_obstacles > 1:
-                    for i in range(self.num_obstacles):
-                        for j in range(i + 1, self.num_obstacles):
-                            dist_sq = np.sum((obs_pos[i] - obs_pos[j]) ** 2)
-                            min_dist_sq = (
-                                current_env_obstacle_radii[i]
-                                + current_env_obstacle_radii[j]
-                                + min_obstacle_separation_buffer
-                            ) ** 2
-                            if dist_sq < min_dist_sq:
-                                obstacles_clear = False
-                                break
-                        if not obstacles_clear:
-                            break
-                if not obstacles_clear:
-                    continue
-
-                # 3. Place each agent's goal and robot sequentially
-                agent_robots = []
-                agent_goals = []
-                all_agents_placed = True
-
-                for agent_idx in range(A):
-                    goal_wall_buffer = max(self.goal_radius, self.robot_radius)
-                    robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
-                    wall_buffer = self.robot_radius + 1.0
-
-                    # --- Place goal for this agent ---
-                    if options and options.get("goal_pos") is not None:
-                        goal_pos = np.array(options["goal_pos"], dtype=np.float32)
-                    else:
-                        goal_pos = self.np_random.uniform(
-                            goal_wall_buffer,
-                            self.world_size - goal_wall_buffer,
-                            size=(2,),
-                        ).astype(np.float32)
-
-                    # Validate goal
-                    goal_hsafe = True
-                    if (
-                        (goal_pos[0] < self.robot_radius)
-                        or (goal_pos[0] > self.world_size - self.robot_radius)
-                        or (goal_pos[1] < self.robot_radius)
-                        or (goal_pos[1] > self.world_size - self.robot_radius)
-                    ):
-                        goal_hsafe = False
-                    if goal_hsafe and self.num_obstacles > 0:
-                        for i, o_pos in enumerate(obs_pos):
-                            if np.linalg.norm(goal_pos - o_pos) < (
-                                self.robot_radius + current_env_obstacle_radii[i]
-                            ):
-                                goal_hsafe = False
-                                break
-                    if goal_hsafe and self.num_obstacles > 0:
-                        for i, o_pos in enumerate(obs_pos):
-                            if np.linalg.norm(goal_pos - o_pos) < (
-                                self.goal_radius + current_env_obstacle_radii[i]
-                            ):
-                                goal_hsafe = False
-                                break
-                    if not goal_hsafe:
-                        all_agents_placed = False
-                        break
-
-                    # --- Place robot for this agent ---
-                    if options and options.get("robot_pos") is not None:
-                        robot_pos = np.array(options["robot_pos"], dtype=np.float32)
-                    else:
-                        robot_pos = self.np_random.uniform(
-                            robot_wall_buffer,
-                            self.world_size - robot_wall_buffer,
-                            size=(2,),
-                        ).astype(np.float32)
-
-                    # Wall clearance
-                    if (
-                        (robot_pos[0] <= wall_buffer)
-                        or (robot_pos[0] >= self.world_size - wall_buffer)
-                        or (robot_pos[1] <= wall_buffer)
-                        or (robot_pos[1] >= self.world_size - wall_buffer)
-                    ):
-                        all_agents_placed = False
-                        break
-
-                    # Clearance from static obstacles
-                    robot_clear = True
-                    for i, o_pos in enumerate(obs_pos):
-                        if (
-                            np.linalg.norm(robot_pos - o_pos)
-                            <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
-                        ):
-                            robot_clear = False
-                            break
-                    if not robot_clear:
-                        all_agents_placed = False
-                        break
-
-                    # Clearance from already-placed agents
-                    for prev_robot in agent_robots:
-                        if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 1.0:
-                            robot_clear = False
-                            break
-                    if not robot_clear:
-                        all_agents_placed = False
-                        break
-
-                    # Minimum robot-to-goal distance
-                    if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
-                        all_agents_placed = False
-                        break
-
-                    # Require obstacle on path for agent 0 only (ensures non-trivial task)
-                    if agent_idx == 0 and self.num_obstacles > 0:
-                        dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
-                        obstacle_blocks_path = False
-                        for i, o_pos in enumerate(obs_pos):
-                            if (
-                                abs(
-                                    np.linalg.norm(robot_pos - o_pos)
-                                    + np.linalg.norm(goal_pos - o_pos)
-                                    - dist_robot_goal
-                                )
-                                < current_env_obstacle_radii[i] * 2
-                            ):
-                                obstacle_blocks_path = True
-                                break
-                        if not obstacle_blocks_path:
-                            all_agents_placed = False
-                            break
-
-                    agent_robots.append(robot_pos)
-                    agent_goals.append(goal_pos)
-
-                if all_agents_placed:
-                    valid_placement = True
-
-            if not valid_placement:
+            result = self._sample_world_layout(obstacle_radii_np[env_idx], options)
+            if result is None:
                 print(
-                    f"Warning: Failed to find valid initial placement for env {env_idx} after {max_placement_attempts} attempts."
+                    f"Warning: Failed to find valid initial placement for env {env_idx}."
                 )
-                # Fall back: place agents at default positions if retry exhausted
-                if len(agent_robots) < A:
-                    for k in range(len(agent_robots), A):
-                        agent_robots.append(np.array([self.world_size * 0.2, self.world_size * (0.2 + k * 0.1)], dtype=np.float32))
-                        agent_goals.append(np.array([self.world_size * 0.8, self.world_size * (0.8 - k * 0.1)], dtype=np.float32))
+                agent_robots = [
+                    np.array(
+                        [self.world_size * 0.2, self.world_size * (0.2 + k * 0.1)],
+                        dtype=np.float32,
+                    )
+                    for k in range(A)
+                ]
+                agent_goals = [
+                    np.array(
+                        [self.world_size * 0.8, self.world_size * (0.8 - k * 0.1)],
+                        dtype=np.float32,
+                    )
+                    for k in range(A)
+                ]
+                obs_pos = np.zeros((self.num_obstacles, 2), dtype=np.float32)
+            else:
+                obs_pos, agent_robots, agent_goals = result
 
-            robot_pos_np[env_idx] = np.array(agent_robots, dtype=np.float32)   # (A, 2)
-            goal_pos_np[env_idx] = np.array(agent_goals, dtype=np.float32)     # (A, 2)
+            robot_pos_np[env_idx] = np.array(agent_robots, dtype=np.float32)
+            goal_pos_np[env_idx] = np.array(agent_goals, dtype=np.float32)
             if self.num_obstacles > 0:
                 obstacle_positions_np[env_idx] = obs_pos
 
@@ -1266,42 +1109,43 @@ class UnifiedNavigationEnv(VecEnv):
         else:
             return None  # Should not happen if render_mode is validated
     
-    def _reset_world_layout(
+    def _sample_world_layout(
         self,
-        world_e: int,
-        robot_pos_np: np.ndarray,
-        goal_pos_np: np.ndarray,
-        obstacle_positions_np: np.ndarray,
-        obstacle_radii_np: np.ndarray,
+        env_obstacle_radii: np.ndarray,
         options: Optional[Dict[str, Any]] = None,
-    ) -> bool:
-        """Sample a fresh obstacle + agent layout for one parallel world.
+    ):
+        """Sample a valid obstacle + agent layout for one world.
 
-        Matches the initial ``reset()`` placement logic. Used for episode-end
-        resets so single-agent training behaves like performance-test (full
-        world re-randomization) and multi-agent worlds reset all agents together
-        with new shared obstacles.
+        Uses a two-level retry strategy:
+          - Outer loop: retry obstacle placement (max 20 attempts).
+          - Inner loop: per-agent retry (max 50 attempts each).
+        This avoids discarding a valid obstacle placement just because one
+        agent sample happened to be invalid, which is the main cause of
+        spurious "Failed to find valid placement" warnings at high agent counts.
+
+        Returns (obs_pos, agent_robots, agent_goals) on success, or None on failure.
         """
         A = self.num_agents
-        placement_attempts = 0
-        max_placement_attempts = 100
-        valid_placement = False
         min_obstacle_separation_buffer = 0.5
         min_robot_goal_distance = self.world_size / 3.0
-        current_env_obstacle_radii = obstacle_radii_np[world_e]
+        current_env_obstacle_radii = env_obstacle_radii
         current_env_max_obstacle_radius = (
             np.max(current_env_obstacle_radii) if self.num_obstacles > 0 else 0.0
         )
-        agent_robots: List[np.ndarray] = []
-        agent_goals: List[np.ndarray] = []
-        obs_pos = np.empty((0, 2), dtype=np.float32)
+        goal_wall_buffer = max(self.goal_radius, self.robot_radius)
+        robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
+        wall_buffer = self.robot_radius + 1.0
 
-        while not valid_placement and placement_attempts < max_placement_attempts:
-            placement_attempts += 1
-            agent_robots = []
-            agent_goals = []
+        fixed_obs = options is not None and options.get("obstacle_pos") is not None
+        fixed_goal = options is not None and options.get("goal_pos") is not None
+        fixed_robot = options is not None and options.get("robot_pos") is not None
 
-            if options and options.get("obstacle_pos") is not None:
+        max_obs_attempts = 1 if fixed_obs else 20
+        max_agent_attempts = 50
+
+        for _ in range(max_obs_attempts):
+            # --- Place obstacles ---
+            if fixed_obs:
                 obs_pos = np.array(options["obstacle_pos"], dtype=np.float32)
             elif self.num_obstacles > 0:
                 obs_pos = self.np_random.uniform(
@@ -1312,6 +1156,7 @@ class UnifiedNavigationEnv(VecEnv):
             else:
                 obs_pos = np.empty((0, 2), dtype=np.float32)
 
+            # Check obstacle-obstacle separation
             obstacles_clear = True
             if self.num_obstacles > 1:
                 for i in range(self.num_obstacles):
@@ -1330,131 +1175,137 @@ class UnifiedNavigationEnv(VecEnv):
             if not obstacles_clear:
                 continue
 
+            # --- Place each agent with its own retry budget ---
+            agent_robots: List[np.ndarray] = []
+            agent_goals: List[np.ndarray] = []
             all_agents_placed = True
+
             for agent_idx in range(A):
-                goal_wall_buffer = max(self.goal_radius, self.robot_radius)
-                robot_wall_buffer = self.robot_radius + 1.0 + 1e-4
-                wall_buffer = self.robot_radius + 1.0
+                agent_placed = False
 
-                if options and options.get("goal_pos") is not None:
-                    goal_pos = np.array(options["goal_pos"], dtype=np.float32)
-                else:
-                    goal_pos = self.np_random.uniform(
-                        goal_wall_buffer,
-                        self.world_size - goal_wall_buffer,
-                        size=(2,),
-                    ).astype(np.float32)
+                for _ in range(max_agent_attempts):
+                    # Sample goal
+                    if fixed_goal:
+                        goal_pos = np.array(options["goal_pos"], dtype=np.float32)
+                    else:
+                        goal_pos = self.np_random.uniform(
+                            goal_wall_buffer,
+                            self.world_size - goal_wall_buffer,
+                            size=(2,),
+                        ).astype(np.float32)
 
-                goal_hsafe = True
-                if (
-                    (goal_pos[0] < self.robot_radius)
-                    or (goal_pos[0] > self.world_size - self.robot_radius)
-                    or (goal_pos[1] < self.robot_radius)
-                    or (goal_pos[1] > self.world_size - self.robot_radius)
-                ):
-                    goal_hsafe = False
-                if goal_hsafe and self.num_obstacles > 0:
-                    for i, o_pos in enumerate(obs_pos):
-                        if np.linalg.norm(goal_pos - o_pos) < (
-                            self.robot_radius + current_env_obstacle_radii[i]
-                        ):
-                            goal_hsafe = False
-                            break
-                if goal_hsafe and self.num_obstacles > 0:
-                    for i, o_pos in enumerate(obs_pos):
-                        if np.linalg.norm(goal_pos - o_pos) < (
-                            self.goal_radius + current_env_obstacle_radii[i]
-                        ):
-                            goal_hsafe = False
-                            break
-                if not goal_hsafe:
-                    all_agents_placed = False
-                    break
-
-                if options and options.get("robot_pos") is not None:
-                    robot_pos = np.array(options["robot_pos"], dtype=np.float32)
-                else:
-                    robot_pos = self.np_random.uniform(
-                        robot_wall_buffer,
-                        self.world_size - robot_wall_buffer,
-                        size=(2,),
-                    ).astype(np.float32)
-
-                if (
-                    (robot_pos[0] <= wall_buffer)
-                    or (robot_pos[0] >= self.world_size - wall_buffer)
-                    or (robot_pos[1] <= wall_buffer)
-                    or (robot_pos[1] >= self.world_size - wall_buffer)
-                ):
-                    all_agents_placed = False
-                    break
-
-                robot_clear = True
-                for i, o_pos in enumerate(obs_pos):
+                    # Validate goal
                     if (
-                        np.linalg.norm(robot_pos - o_pos)
-                        <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
+                        goal_pos[0] < self.robot_radius
+                        or goal_pos[0] > self.world_size - self.robot_radius
+                        or goal_pos[1] < self.robot_radius
+                        or goal_pos[1] > self.world_size - self.robot_radius
                     ):
-                        robot_clear = False
-                        break
-                if not robot_clear:
-                    all_agents_placed = False
-                    break
+                        continue
+                    goal_ok = True
+                    for i, o_pos in enumerate(obs_pos):
+                        if np.linalg.norm(goal_pos - o_pos) < (
+                            max(self.robot_radius, self.goal_radius)
+                            + current_env_obstacle_radii[i]
+                        ):
+                            goal_ok = False
+                            break
+                    if not goal_ok:
+                        continue
 
-                for prev_robot in agent_robots:
-                    if np.linalg.norm(robot_pos - prev_robot) <= 2 * self.robot_radius + 1.0:
-                        robot_clear = False
-                        break
-                if not robot_clear:
-                    all_agents_placed = False
-                    break
+                    # Sample robot position
+                    if fixed_robot:
+                        robot_pos = np.array(options["robot_pos"], dtype=np.float32)
+                    else:
+                        robot_pos = self.np_random.uniform(
+                            robot_wall_buffer,
+                            self.world_size - robot_wall_buffer,
+                            size=(2,),
+                        ).astype(np.float32)
 
-                if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
-                    all_agents_placed = False
-                    break
+                    # Wall clearance
+                    if (
+                        robot_pos[0] <= wall_buffer
+                        or robot_pos[0] >= self.world_size - wall_buffer
+                        or robot_pos[1] <= wall_buffer
+                        or robot_pos[1] >= self.world_size - wall_buffer
+                    ):
+                        continue
 
-                if agent_idx == 0 and self.num_obstacles > 0:
-                    dist_robot_goal = np.linalg.norm(robot_pos - goal_pos)
-                    obstacle_blocks_path = False
+                    # Obstacle clearance
+                    robot_ok = True
                     for i, o_pos in enumerate(obs_pos):
                         if (
-                            abs(
-                                np.linalg.norm(robot_pos - o_pos)
-                                + np.linalg.norm(goal_pos - o_pos)
-                                - dist_robot_goal
-                            )
-                            < current_env_obstacle_radii[i] * 2
+                            np.linalg.norm(robot_pos - o_pos)
+                            <= self.robot_radius + current_env_obstacle_radii[i] + 1.0
                         ):
-                            obstacle_blocks_path = True
+                            robot_ok = False
                             break
-                    if not obstacle_blocks_path:
-                        all_agents_placed = False
-                        break
+                    if not robot_ok:
+                        continue
 
-                agent_robots.append(robot_pos)
-                agent_goals.append(goal_pos)
+                    # Inter-agent clearance
+                    for prev_robot in agent_robots:
+                        if (
+                            np.linalg.norm(robot_pos - prev_robot)
+                            <= 2 * self.robot_radius + 1.0
+                        ):
+                            robot_ok = False
+                            break
+                    if not robot_ok:
+                        continue
+
+                    # Minimum robot-to-goal distance
+                    if np.linalg.norm(robot_pos - goal_pos) < min_robot_goal_distance:
+                        continue
+
+                    # Agent 0: require at least one obstacle on the path
+                    if agent_idx == 0 and self.num_obstacles > 0:
+                        dist_rg = np.linalg.norm(robot_pos - goal_pos)
+                        blocks = False
+                        for i, o_pos in enumerate(obs_pos):
+                            if (
+                                abs(
+                                    np.linalg.norm(robot_pos - o_pos)
+                                    + np.linalg.norm(goal_pos - o_pos)
+                                    - dist_rg
+                                )
+                                < current_env_obstacle_radii[i] * 2
+                            ):
+                                blocks = True
+                                break
+                        if not blocks:
+                            continue
+
+                    agent_robots.append(robot_pos)
+                    agent_goals.append(goal_pos)
+                    agent_placed = True
+                    break
+
+                if not agent_placed:
+                    all_agents_placed = False
+                    break
 
             if all_agents_placed:
-                valid_placement = True
+                return obs_pos, agent_robots, agent_goals
 
-        if not valid_placement:
+        return None
+
+    def _reset_world_layout(
+        self,
+        world_e: int,
+        robot_pos_np: np.ndarray,
+        goal_pos_np: np.ndarray,
+        obstacle_positions_np: np.ndarray,
+        obstacle_radii_np: np.ndarray,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Sample a fresh obstacle + agent layout for one parallel world."""
+        A = self.num_agents
+        result = self._sample_world_layout(obstacle_radii_np[world_e], options)
+        if result is None:
             return False
-
-        if len(agent_robots) < A:
-            for k in range(len(agent_robots), A):
-                agent_robots.append(
-                    np.array(
-                        [self.world_size * 0.2, self.world_size * (0.2 + k * 0.1)],
-                        dtype=np.float32,
-                    )
-                )
-                agent_goals.append(
-                    np.array(
-                        [self.world_size * 0.8, self.world_size * (0.8 - k * 0.1)],
-                        dtype=np.float32,
-                    )
-                )
-
+        obs_pos, agent_robots, agent_goals = result
         robot_pos_np[world_e] = np.array(agent_robots, dtype=np.float32)
         goal_pos_np[world_e] = np.array(agent_goals, dtype=np.float32)
         if self.num_obstacles > 0:

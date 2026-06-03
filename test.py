@@ -49,6 +49,8 @@ def parse_args():
                               "env_meta.json; falls back to 'legacy' (last_velocity)."))
     parser.add_argument('--num_agents', type=int, default=None,
                         help="Number of agents per world (default: config NUM_AGENTS=1)")
+    parser.add_argument('--num_obstacles', type=int, default=None,
+                        help="Number of static obstacles per world (default: auto-detected from env_meta.json)")
     parser.add_argument('--control_noise', type=str, default=None,
                         choices=list(UnifiedNavigationEnv.CONTROL_NOISE_LEVELS),
                         help=("Stochastic Gaussian control-input noise level "
@@ -416,6 +418,17 @@ def test():
         resolved_num_agents = cfg['env']['num_agents']
     print(f"--> num_agents resolved to {resolved_num_agents}")
 
+    if args.num_obstacles is not None:
+        resolved_num_obstacles = args.num_obstacles
+        obstacles_source = "CLI flag --num_obstacles"
+    elif isinstance(meta.get("num_obstacles"), int) and meta["num_obstacles"] >= 0:
+        resolved_num_obstacles = meta["num_obstacles"]
+        obstacles_source = f"env_meta.json ({meta_path})"
+    else:
+        resolved_num_obstacles = cfg['env']['num_obstacles']
+        obstacles_source = "config default"
+    print(f"--> num_obstacles resolved to {resolved_num_obstacles} from {obstacles_source}")
+
     if args.control_noise is not None:
         resolved_control_noise = args.control_noise
         noise_source = "CLI flag --control_noise"
@@ -429,11 +442,12 @@ def test():
 
     # --- Environment Setup ---
     render_mode = None if args.headless else ("human" if cfg['runner']['render_test'] else None)
-    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents', 'control_noise']}
+    env_kwargs = {k: v for k, v in cfg['env'].items() if k not in ['env_id', 'num_envs', 'num_agents', 'num_obstacles', 'control_noise']}
     eval_env = UnifiedNavigationEnv(
         render_mode=render_mode,
         num_envs=1,
         num_agents=resolved_num_agents,
+        num_obstacles=resolved_num_obstacles,
         noise_level=0.0,
         device=cfg['device'],
         use_cbf_action_filtering=args.use_cbf_action_filtering,
@@ -701,7 +715,7 @@ def test():
         f"CBF Filter:     {args.use_cbf_action_filtering}",
         f"CBF Penalty:    {args.use_cbf_reward_penalty}",
         f"Agents:         {resolved_num_agents}",
-        f"Obstacles:      {cfg['env']['num_obstacles']}",
+        f"Obstacles:      {resolved_num_obstacles}",
         f"Episodes:       {num_episodes}",
         f"Mean Reward:    {mean_reward:.2f} +/- {std_reward:.2f}",
         f"Success Rate:   {success_rate:.2%}",

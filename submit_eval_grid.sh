@@ -36,6 +36,16 @@ fi
 LOGS_DIR="$REPO_ROOT/logs"
 MANIFEST="$SCRIPT_DIR/.eval_manifest.tsv"
 
+test_script() {
+    case "$1" in
+        naive)        echo "./test_naive.sh" ;;
+        cbf)          echo "./test_cbf.sh" ;;
+        filter_only)  echo "./test_filter_only.sh" ;;
+        reward_only)  echo "./test_reward_only.sh" ;;
+        *)            echo "./test_naive.sh" ;;
+    esac
+}
+
 # ---------------------------------------------------------------------------
 # Discover all run directories that have env_meta.json + a checkpoint
 # ---------------------------------------------------------------------------
@@ -117,9 +127,10 @@ case "$MODE" in
         echo "Found $NUM_RUNS trained runs. Starting evaluation..."
         idx=0
         while IFS=$'\t' read -r env_type run_dir; do
+            script="$(test_script "$env_type")"
             echo "=== Eval [$idx] env=$env_type ==="
             echo "Run dir: $run_dir"
-            python test.py --env "$env_type" --load_run "$run_dir" --headless
+            $script --load_run "$run_dir" --headless
             idx=$((idx + 1))
         done < "$MANIFEST"
         ;;
@@ -190,8 +201,9 @@ EOF
         env_type="$(echo "$line" | cut -f1)"
         run_dir="$(echo "$line" | cut -f2)"
 
+        script="$(test_script "$env_type")"
         echo "=== Eval [$IDX] env=$env_type ==="
         echo "Run dir: $run_dir"
-        python test.py --env "$env_type" --load_run "$run_dir" --headless
+        $script --load_run "$run_dir" --headless
         ;;
 esac

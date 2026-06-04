@@ -1,0 +1,20 @@
+=== Evaluation Summary: NAIVE ===
+Timestamp:      20260604_030000
+Training run:   navigation_naive_20260603_011730
+Checkpoint:     model_1499.pt
+Training path:  /gscratch/scrubbed/jang1601/cbf-rl-environment/logs/navigation_naive/navigation_naive_20260603_011730
+Dynamics:       dynamic
+Obs layout:     legacy
+Control noise:  low
+CBF Filter:     False
+CBF Penalty:    False
+Agents:         4
+Obstacles:      1
+Episodes:       1000
+Mean Reward:    5201.60 +/- 2685.55
+Success Rate:   28.70%
+Failures:       713 (71.30%)
+ - Obstacle:    711 (71.10%)
+ - Wall:        1 (0.10%)
+ - Timeout:     1 (0.10%)
+========================================

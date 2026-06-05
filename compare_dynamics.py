@@ -51,7 +51,7 @@ FIELD_RES = {
     "agents": re.compile(r"^Agents:\s+(\d+)"),
     "obstacles": re.compile(r"^Obstacles:\s+(\d+)"),
     "episodes": re.compile(r"^Episodes:\s+(\d+)"),
-    "mean_reward": re.compile(r"^Mean Reward:\s+([\d.]+)"),
+    "mean_reward": re.compile(r"^Mean Reward:\s+(-?[\d.]+)"),
     "success_rate": re.compile(r"^Success Rate:\s+([\d.]+)%"),
     "failures_total": re.compile(r"^Failures:\s+(\d+)"),
     "failure_obstacle": re.compile(r"^ - Obstacle:\s+(\d+)"),

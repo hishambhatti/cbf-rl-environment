@@ -369,9 +369,13 @@ def plot_mean_reward_bars(
             color=POLICY_COLORS[policy],
         )
 
+    ax.axhline(0, color="black", linewidth=0.8, zorder=1)
     ax.set_ylabel("Mean episode reward")
     ax.set_xlabel("Agents / obstacles (sum = 5)")
-    ax.set_title("Mean reward by environment density (dynamic, low noise)")
+    ax.set_title(
+        "Mean reward by environment density (dynamic, low noise)\n"
+        "(negative values: CBF penalty-dominated episodes)"
+    )
     ax.set_xticks(x)
     ax.set_xticklabels([config_label(a, o) for a, o in AGENT_OBSTACLE_CONFIGS])
     ax.legend(loc="upper right", fontsize=9)

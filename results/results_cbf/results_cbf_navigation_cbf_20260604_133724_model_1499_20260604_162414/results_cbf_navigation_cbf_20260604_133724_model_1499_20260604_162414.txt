@@ -1,0 +1,20 @@
+=== Evaluation Summary: CBF ===
+Timestamp:      20260604_162414
+Training run:   navigation_cbf_20260604_133724
+Checkpoint:     model_1499.pt
+Training path:  logs/navigation_cbf/navigation_cbf_20260604_133724
+Dynamics:       dynamic
+Obs layout:     legacy
+Control noise:  low
+CBF Filter:     True
+CBF Penalty:    True
+Agents:         1
+Obstacles:      3
+Episodes:       1000
+Mean Reward:    2114.44 +/- 640.10
+Success Rate:   97.60%
+Failures:       24 (2.40%)
+ - Obstacle:    8 (0.80%)
+ - Wall:        2 (0.20%)
+ - Timeout:     14 (1.40%)
+========================================

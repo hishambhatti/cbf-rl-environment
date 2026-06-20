@@ -1,0 +1,20 @@
+=== Evaluation Summary: REWARD_ONLY ===
+Timestamp:      20260604_043908
+Training run:   navigation_reward_only_20260603_053734
+Checkpoint:     model_1499.pt
+Training path:  /gscratch/scrubbed/jang1601/cbf-rl-environment/logs/navigation_reward_only/navigation_reward_only_20260603_053734
+Dynamics:       dynamic
+Obs layout:     legacy
+Control noise:  low
+CBF Filter:     False
+CBF Penalty:    True
+Agents:         4
+Obstacles:      1
+Episodes:       1000
+Mean Reward:    -13543.76 +/- 34553.54
+Success Rate:   24.00%
+Failures:       760 (76.00%)
+ - Obstacle:    675 (67.50%)
+ - Wall:        65 (6.50%)
+ - Timeout:     20 (2.00%)
+========================================

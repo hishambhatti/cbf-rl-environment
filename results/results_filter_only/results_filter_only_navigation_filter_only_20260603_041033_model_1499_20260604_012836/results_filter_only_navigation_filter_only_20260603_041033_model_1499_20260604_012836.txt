@@ -1,0 +1,20 @@
+=== Evaluation Summary: FILTER_ONLY ===
+Timestamp:      20260604_012836
+Training run:   navigation_filter_only_20260603_041033
+Checkpoint:     model_1499.pt
+Training path:  /gscratch/scrubbed/jang1601/cbf-rl-environment/logs/navigation_filter_only/navigation_filter_only_20260603_041033
+Dynamics:       dynamic
+Obs layout:     legacy
+Control noise:  high
+CBF Filter:     True
+CBF Penalty:    False
+Agents:         3
+Obstacles:      2
+Episodes:       1000
+Mean Reward:    5681.50 +/- 1610.06
+Success Rate:   64.60%
+Failures:       354 (35.40%)
+ - Obstacle:    346 (34.60%)
+ - Wall:        7 (0.70%)
+ - Timeout:     1 (0.10%)
+========================================

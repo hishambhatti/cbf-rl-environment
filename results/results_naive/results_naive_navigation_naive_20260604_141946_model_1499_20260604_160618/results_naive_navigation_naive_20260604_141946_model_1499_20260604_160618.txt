@@ -1,0 +1,20 @@
+=== Evaluation Summary: NAIVE ===
+Timestamp:      20260604_160618
+Training run:   navigation_naive_20260604_141946
+Checkpoint:     model_1499.pt
+Training path:  logs/navigation_naive/navigation_naive_20260604_141946
+Dynamics:       dynamic
+Obs layout:     legacy
+Control noise:  low
+CBF Filter:     False
+CBF Penalty:    False
+Agents:         1
+Obstacles:      3
+Episodes:       1000
+Mean Reward:    1912.11 +/- 787.10
+Success Rate:   63.50%
+Failures:       365 (36.50%)
+ - Obstacle:    352 (35.20%)
+ - Wall:        2 (0.20%)
+ - Timeout:     11 (1.10%)
+========================================

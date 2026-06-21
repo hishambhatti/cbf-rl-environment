@@ -40,6 +40,7 @@ smmap==5.0.3
 sympy==1.13.3
 tensorboard==2.20.0
 tensorboard-data-server==0.7.2
+triton==3.0.0
 typing_extensions==4.15.0
 Werkzeug==3.1.8
 wheel==0.47.0

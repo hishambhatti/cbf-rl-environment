@@ -34,8 +34,6 @@ Yang et al. [1] propose a dual CBF-RL approach that combines two mechanisms duri
 
 We test whether this framework generalizes to multi-agent navigation with double-integrator dynamics and stochastic control noise, meant to better represent real-world conditions. This repo implements that extension and systematically ablates which component (filter, reward, or dual) actually teaches the policy to behave safely.
 
----
-
 ## Four Training Modes (Ablation)
 
 Each mode trains the same PPO policy architecture. Only the action pipeline and reward differ.
@@ -60,8 +58,6 @@ Reward Only and Filter Only are almost opposites in what information reaches the
 ./train_cbf.sh          # CBF filter + CBF reward penalty (Dual)
 ```
 
----
-
 ## Installation
 
 ### Option A — Conda (recommended for GPU clusters)
@@ -80,8 +76,6 @@ pip install -r requirements.txt
 ```
 
 Requires Python 3.10+, PyTorch with CUDA, and qpth for differentiable QP-based CBF filtering. For CPU-only development, use `requirements_cpu.txt`.
-
----
 
 ## Quick Start
 
@@ -158,8 +152,6 @@ The flat observation vector is built by **sorting dict keys alphabetically**. Re
 
 </details>
 
----
-
 ## Results
 
 68 experiments, 1000 eval episodes each. All numbers below are success rate (%). Plots in [`results/plots/`](results/plots/). Generated with `compare/compare_*.py`.
@@ -177,9 +169,6 @@ The flat observation vector is built by **sorting dict keys alphabetically**. Re
 | Filter Only | 98.3 | 88.6 |
 | **Dual (CBF)** | **96.7** | **97.6** |
 
-**Conclusion:** Filter-only and reward-only have changes in performance, but dual CBF still performs best. For naive, failures are mostly obstacle collisions. CBF quasi-static fails almost entirely via timeout, dynamic adds a few obstacle hits. Reward Only sees the biggest dynamics swing, where quasi-static is timeout-dominated. Filter Only is hurt by dynamic as failures shift from timeout to obstacle collision (10.6%).
-
-
 ### Agent / obstacle density (dynamic, low noise)
 
 <p align="center">
@@ -194,8 +183,6 @@ The flat observation vector is built by **sorting dict keys alphabetically**. Re
 | 4A / 1O | 28.7 | 24.0 | **57.8** | 17.7 |
 | 5A / 0O | 41.4 | 25.7 | **60.6** | 6.0 |
 
-**Patterns:** CBF and Reward Only improve sharply as obstacles increase (5A/0O is worst, 1A/4O is best — 6% → 96% for CBF). Naive stays flat at 30–57% with little structure. Filter Only is more stable (58–87%) but does not reach CBF peaks at 1A/4O. CBF at 5A/0O and 4A/1O is dominated by timeouts (~33–38%), not obstacles.
-
 ### Control noise (1A / 4O, dynamic)
 
 <p align="center">
@@ -207,8 +194,6 @@ The flat observation vector is built by **sorting dict keys alphabetically**. Re
 | Low | 57.0 | 91.4 | 87.2 | 96.4 |
 | Medium | 53.4 | 94.9 | 88.7 | 96.7 |
 | High | 58.4 | 91.8 | 83.6 | 95.5 |
-
-**Patterns:** CBF holds ~95–97% across noise levels. Reward Only is similarly stable (91–95%), slightly best at medium noise. Filter Only drops at high noise (87% → 84%) as obstacle collisions rise. Naive is flat (53–58%); medium noise increases timeouts (8.4% vs ~2–5% at low/high). Noise matters less here than agent/obstacle density.
 
 ### Full grid (dynamic) — success rate by policy
 
@@ -238,37 +223,13 @@ Rows = agent/obstacle config (A/O sum to 5). Columns = control noise.
 
 | Dual (CBF) — success | Naive — collision |
 |:---:|:---:|
-| <video src="results/figs/videos/navigation_cbf_20260603_030218_0005_success.mp4" controls width="280"></video> | <video src="results/figs/videos/navigation_naive_20260603_011730_0055_obstacle_collision.mp4" controls width="280"></video> |
+| <video src="results/figs/videos/navigation_cbf_20260603_030218_0005_success.mp4" controls width="350"></video> | <video src="results/figs/videos/navigation_naive_20260603_011730_0055_obstacle_collision.mp4" controls width="350"></video> |
 
 | Filter Only — success | Reward Only — collision |
 |:---:|:---:|
-| <video src="results/figs/videos/navigation_filter_only_20260603_041332_0025_success.mp4" controls width="280"></video> | <video src="results/figs/videos/navigation_reward_only_20260603_053734_0040_obstacle_collision.mp4" controls width="280"></video> |
+| <video src="results/figs/videos/navigation_filter_only_20260603_041332_0025_success.mp4" controls width="350"></video> | <video src="results/figs/videos/navigation_reward_only_20260603_053734_0040_obstacle_collision.mp4" controls width="350"></video> |
 
 More media: [`results/figs/pics/`](results/figs/pics/) · [`results/figs/videos/`](results/figs/videos/)
-
----
-
-## Training & Monitoring
-
-```bash
-# Direct Python invocation
-python train.py --env cbf --use_cbf_action_filtering --use_cbf_reward_penalty --headless
-
-# TensorBoard
-tensorboard --logdir logs/ --port 6006
-
-# Plot mean episode reward across policies
-python plot_tb_reward_log_steps.py \
-    --cbf logs/navigation_cbf/.../events.out.tfevents... \
-    --naive logs/navigation_naive/.../events.out.tfevents... \
-    --only-cbf logs/navigation_filter_only/.../events.out.tfevents... \
-    --soft-cbf logs/navigation_reward_only/.../events.out.tfevents... \
-    --out-main logs/plots/mean_episode_reward.pdf
-```
-
-**Training setup:** PPO via [rsl-rl](https://github.com/leggedrobotics/rsl_rl) [4], 4096 parallel worlds, 48-step rollouts, 1500 iterations. MLP actor/critic `[obs_dim → 32 → 32 → action_dim]`, γ = 0.99, clip ε = 0.2, lr = 3×10⁻⁴.
-
----
 
 ## Acknowledgements
 
